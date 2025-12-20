@@ -9492,6 +9492,9 @@ class solax_plugin(plugin_base):
         elif seriesnumber.startswith("H35F1"):
             invertertype = HYBRID | GEN5 | X3  # X3-IES 10-15kW F
             self.inverter_model = f"X3-IES-{seriesnumber[4:6]}kW"
+        elif seriesnumber.startswith("H3BC15LA"):
+            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 15KP C
+            self.inverter_model = "X3-Ultra-15kW"
         elif seriesnumber.startswith("H3BC15"):
             invertertype = HYBRID | GEN5 | X3  # X3 Ultra C
             self.inverter_model = "X3-Ultra-15kW"
