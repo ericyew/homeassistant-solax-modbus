@@ -1,11 +1,56 @@
-import logging
 import asyncio
+import logging
 from dataclasses import dataclass
-from homeassistant.components.number import NumberEntityDescription
-from homeassistant.components.select import SelectEntityDescription
-from homeassistant.components.button import ButtonEntityDescription
+from datetime import datetime
+
+from homeassistant.components.number import NumberDeviceClass
+from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
+from homeassistant.const import (
+    PERCENTAGE,
+    UnitOfApparentPower,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfFrequency,
+    UnitOfPower,
+    UnitOfTemperature,
+    UnitOfTime,
+)
+from homeassistant.helpers.entity import EntityCategory
+
+from custom_components.solax_modbus.const import (
+    CONF_READ_DCB,
+    CONF_READ_EPS,
+    CONF_READ_PM,
+    DEFAULT_READ_DCB,
+    DEFAULT_READ_EPS,
+    DEFAULT_READ_PM,
+    REG_HOLDING,
+    REGISTER_S16,
+    REGISTER_S32,
+    REGISTER_STR,
+    REGISTER_U16,
+    REGISTER_U32,
+    REGISTER_WORDS,
+    SCAN_GROUP_DEFAULT,
+    SCAN_GROUP_FAST,
+    SCAN_GROUP_MEDIUM,
+    WRITE_DATA_LOCAL,
+    WRITE_MULTI_MODBUS,
+    WRITE_MULTISINGLE_MODBUS,
+    BaseModbusButtonEntityDescription,
+    BaseModbusNumberEntityDescription,
+    BaseModbusSelectEntityDescription,
+    BaseModbusSensorEntityDescription,
+    UnitOfReactivePower,
+    base_battery_config,
+    plugin_base,
+    value_function_2byte_timestamp,
+    value_function_disabled_enabled,
+    value_function_rtc_ymd,
+)
+
 from .pymodbus_compat import DataType, convert_from_registers
-from custom_components.solax_modbus.const import *
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -16,7 +61,7 @@ within a group, the bits in an entity declaration will be interpreted as OR
 between groups, an AND condition is applied, so all gruoups must match.
 An empty group (group without active flags) evaluates to True.
 example: GEN3 | GEN4 | X1 | X3 | EPS
-means:  any inverter of tyoe (GEN3 or GEN4) and (X1 or X3) and (EPS)
+means:  any inverter of type (GEN3 or GEN4) and (X1 or X3) and (EPS)
 An entity can be declared multiple times (with different bitmasks) if the parameters are different for each inverter type
 """
 
@@ -73,12 +118,10 @@ async def async_read_serialnr(hub, address, swapbytes):
                 ba[0::2], ba[1::2] = ba[1::2], ba[0::2]  # swap bytes ourselves - due to bug in Endian.LITTLE ?
                 res = str(ba, "ascii")  # convert back to string
             hub.seriesnumber = res
-    except Exception as ex:
+    except Exception:
         _LOGGER.warning(f"{hub.name}: attempt to read serialnumber failed at 0x{address:x}", exc_info=True)
     if not res:
-        _LOGGER.warning(
-            f"{hub.name}: reading serial number from address 0x{address:x} failed; other address may succeed"
-        )
+        _LOGGER.warning(f"{hub.name}: reading serial number from address 0x{address:x} failed; other address may succeed")
     _LOGGER.info(f"Read {hub.name} 0x{address:x} serial number: {res}, swapped: {swapbytes}")
     # return 'SP1ES2'
     return res
@@ -161,7 +204,7 @@ def value_function_epscontrol(initval, descr, datadict):
         ),
         (
             "eps_wait_time",
-            0, # Always 0 as this is a reserved function that should not be used.
+            0,  # Always 0 as this is a reserved function that should not be used.
         ),
     ]
 
@@ -233,7 +276,11 @@ BUTTON_TYPES = [
         write_method=WRITE_MULTI_MODBUS,
         icon="mdi:battery-check",
         value_function=value_function_passivemode,
-        depends_on= ("passive_mode_grid_power", "passive_mode_battery_power_min", "passive_mode_battery_power_max",),
+        depends_on=(
+            "passive_mode_grid_power",
+            "passive_mode_battery_power_min",
+            "passive_mode_battery_power_max",
+        ),
     ),
     SofarModbusButtonEntityDescription(
         name="Passive: Update Timeout",
@@ -243,7 +290,10 @@ BUTTON_TYPES = [
         write_method=WRITE_MULTI_MODBUS,
         icon="mdi:timer",
         value_function=value_function_passive_timeout,
-        depends_on=("passive_mode_timeout", "passive_mode_timeout_action", ),
+        depends_on=(
+            "passive_mode_timeout",
+            "passive_mode_timeout_action",
+        ),
     ),
     # Unlikely to work as Sofar requires writing 7 registers, where the last needs to have the constant value of '1' during a write operation.
     SofarModbusButtonEntityDescription(
@@ -263,7 +313,10 @@ BUTTON_TYPES = [
         write_method=WRITE_MULTI_MODBUS,
         icon="mdi:transmission-tower-import",
         value_function=value_function_refluxcontrol,
-        depends_on=("feedin_limitation_mode", "feedin_max_power",),
+        depends_on=(
+            "feedin_limitation_mode",
+            "feedin_max_power",
+        ),
     ),
     SofarModbusButtonEntityDescription(
         name="EPS: Update",
@@ -273,7 +326,10 @@ BUTTON_TYPES = [
         write_method=WRITE_MULTI_MODBUS,
         icon="mdi:power-plug-off",
         value_function=value_function_epscontrol,
-        depends_on=("eps_control", "eps_wait_time", ),
+        depends_on=(
+            "eps_control",
+            "eps_wait_time",
+        ),
     ),
     SofarModbusButtonEntityDescription(
         name="IV Curve Scan",
@@ -1099,7 +1155,7 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         name="Serial Number",
         key="serial_number",
         register=0x445,
-        #newblock=True,
+        # newblock=True,
         unit=REGISTER_STR,
         wordcount=7,
         entity_category=EntityCategory.DIAGNOSTIC,
@@ -1110,8 +1166,8 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         key="hardware_version",
         register=0x44D,
         unit=REGISTER_STR,
-        #newblock=True, # due to problems reported by some users
-        entity_registry_enabled_default=False, # causing problems for some users
+        # newblock=True, # due to problems reported by some users
+        entity_registry_enabled_default=False,  # causing problems for some users
         wordcount=2,
         entity_category=EntityCategory.DIAGNOSTIC,
         allowedtypes=HYBRID | PV,
@@ -3273,7 +3329,7 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
             9: "EMS",
             10: "Nilar",
             11: "BTS 5K",
-            11: "Move for",
+            12: "Move for",
         },
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
@@ -3296,7 +3352,7 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         name="BatConfig: Charging Voltage",
         key="bat_config_charging_voltage",
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
-        newblock=True, #added issue #1543
+        newblock=True,  # added issue #1543
         register=0x1048,
         scale=0.1,
         rounding=1,
@@ -3955,12 +4011,12 @@ class battery_config(base_battery_config):
         self.batt_pack_serials[self.selected_batt_nr][self.selected_batt_pack_nr] = serial_number
 
     async def get_batt_pack_quantity(self, hub):
-        if self.number_cels_in_parallel == None:
+        if self.number_cels_in_parallel is None:
             await self._determine_bat_quantitys(hub)
         return self.number_cels_in_parallel
 
     async def get_batt_quantity(self, hub):
-        if self.number_strings == None:
+        if self.number_strings is None:
             await self._determine_bat_quantitys(hub)
         return self.number_strings
 
@@ -3968,9 +4024,7 @@ class battery_config(base_battery_config):
         faulty_nr = 0
         payload = faulty_nr << 12 | batt_pack_nr << 8 | batt_nr
         _LOGGER.debug(f"select batt-nr: {batt_nr} batt-pack: {batt_pack_nr} {hex(payload)}")
-        await hub.async_write_registers_single(
-            unit=hub._modbus_addr, address=self.bms_inquire_address, payload=payload
-        )
+        await hub.async_write_registers_single(unit=hub._modbus_addr, address=self.bms_inquire_address, payload=payload)
         await asyncio.sleep(0.3)
         self.selected_batt_nr = batt_nr
         self.selected_batt_pack_nr = batt_pack_nr
@@ -3992,8 +4046,8 @@ class battery_config(base_battery_config):
                 raw = convert_from_registers(inverter_data.registers[: self.batt_pack_model_len], DataType.STRING, "big")
                 serial = raw.decode("ascii", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
                 return serial
-        except:
-            _LOGGER.warning(f"Cannot read batt pack serial")
+        except Exception:
+            _LOGGER.warning("Cannot read batt pack serial")
             return None
 
     async def get_batt_pack_sw_version(self, hub, new_data, key_prefix):
@@ -4011,20 +4065,18 @@ class battery_config(base_battery_config):
 
         faulty_nr = 0
         payload = faulty_nr << 12 | batt_pack_nr << 8 | batt_nr
-        for retry in range(0, 10):
-            inverter_data = await hub.async_read_holding_registers(
-                unit=hub._modbus_addr, address=self.bms_check_address, count=1
-            )
+        for _retry in range(0, 10):
+            inverter_data = await hub.async_read_holding_registers(unit=hub._modbus_addr, address=self.bms_check_address, count=1)
             if inverter_data is not None and not inverter_data.isError():
-                readed = convert_from_registers(inverter_data.registers[:1], DataType.UINT16, "big")
-                ok = readed == payload
+                read = convert_from_registers(inverter_data.registers[:1], DataType.UINT16, "big")
+                ok = read == payload
                 if not ok:
                     await asyncio.sleep(0.3)
                 else:
                     return True
 
             else:
-                _LOGGER.error(f"can't read batt check register")
+                _LOGGER.error("can't read batt check register")
                 return False
 
     async def check_battery_on_end(self, hub, old_data, new_data, key_prefix, batt_nr: int, batt_pack_nr: int):
@@ -4036,9 +4088,7 @@ class battery_config(base_battery_config):
 
         faulty_nr = 0
         compare_value = faulty_nr << 12 | batt_pack_nr << 8 | batt_nr
-        inverter_data = await hub.async_read_holding_registers(
-            unit=hub._modbus_addr, address=self.bms_check_address, count=1
-        )
+        inverter_data = await hub.async_read_holding_registers(unit=hub._modbus_addr, address=self.bms_check_address, count=1)
         if not inverter_data.isError():
             if inverter_data is not None and not inverter_data.isError():
                 new_value = convert_from_registers(inverter_data.registers[:1], DataType.UINT16, "big")
@@ -4057,17 +4107,14 @@ class battery_config(base_battery_config):
         return False
 
     async def _determine_bat_quantitys(self, hub):
-        res = None
         try:
-            inverter_data = await hub.async_read_holding_registers(
-                unit=hub._modbus_addr, address=self.bapack_number_address, count=1
-            )
+            inverter_data = await hub.async_read_holding_registers(unit=hub._modbus_addr, address=self.bapack_number_address, count=1)
             if inverter_data is not None and not inverter_data.isError():
                 val = convert_from_registers(inverter_data.registers[:1], DataType.UINT16, "big")
                 self.number_cels_in_parallel = (val >> 8) & 0xFF  # high byte
-                self.number_strings = val & 0xFF                  # low byte
-        except Exception as ex:
-            _LOGGER.warning(f"{hub.name}: attempt to read BaPack number failed at 0x{address:x}", exc_info=True)
+                self.number_strings = val & 0xFF  # low byte
+        except Exception:
+            _LOGGER.warning(f"{hub.name}: attempt to read BaPack number failed at 0x{self.bapack_number_address:x}", exc_info=True)
 
     async def init_batt_pack_serials(self, hub):
         retry = 0
@@ -4204,9 +4251,7 @@ class sofar_plugin(plugin_base):
             for start in blacklist:
                 if serialnumber.startswith(start):
                     blacklisted = True
-        return (
-            genmatch and xmatch and hybmatch and epsmatch and dcbmatch and pmmatch and mpptmatch
-        ) and not blacklisted
+        return (genmatch and xmatch and hybmatch and epsmatch and dcbmatch and pmmatch and mpptmatch) and not blacklisted
 
     def getSoftwareVersion(self, new_data):
         return new_data.get("software_version", None)
@@ -4227,8 +4272,8 @@ plugin_instance = sofar_plugin(
     block_size=48,
     order32="big",
     auto_block_ignore_readerror=True,
-    default_holding_scangroup = SCAN_GROUP_DEFAULT,  
-    default_input_scangroup = SCAN_GROUP_DEFAULT,   # or SCAN_GROUP_AUTO
-    auto_default_scangroup = SCAN_GROUP_FAST, # only used when default_xxx_scangroup is set to SCAN_GROUP_AUTO
-    auto_slow_scangroup = SCAN_GROUP_MEDIUM, # only usedwhen default_xxx_scangroup is set to SCAN_GROUP_AUTO
+    default_holding_scangroup=SCAN_GROUP_DEFAULT,
+    default_input_scangroup=SCAN_GROUP_DEFAULT,  # or SCAN_GROUP_AUTO
+    auto_default_scangroup=SCAN_GROUP_FAST,  # only used when default_xxx_scangroup is set to SCAN_GROUP_AUTO
+    auto_slow_scangroup=SCAN_GROUP_MEDIUM,  # only usedwhen default_xxx_scangroup is set to SCAN_GROUP_AUTO
 )
