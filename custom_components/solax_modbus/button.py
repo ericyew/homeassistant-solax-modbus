@@ -20,6 +20,7 @@ from .const import (
     WRITE_SINGLE_MODBUS,
     BaseModbusButtonEntityDescription,
     autorepeat_set,
+    matches_modbus_protocol,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,7 +42,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     entities = []
     for button_info in plugin.BUTTON_TYPES:
-        if plugin.matchInverterWithMask(hub._invertertype, button_info.allowedtypes, hub.seriesnumber, button_info.blacklist):
+        if plugin.matchInverterWithMask(
+            hub._invertertype, button_info.allowedtypes, hub.seriesnumber, button_info.blacklist
+        ) and matches_modbus_protocol(hub, button_info):
             if not (button_info.name.startswith(inverter_name_suffix)):
                 button_info = replace(button_info, name=inverter_name_suffix + button_info.name)
             button = SolaXModbusButton(hub_name, hub, modbus_addr, hub.device_info, button_info)
@@ -97,6 +100,7 @@ class SolaXModbusButton(ButtonEntity):
         self._register = button_info.register
         self._command = button_info.command
         self._attr_icon = button_info.icon
+        self._attr_entity_category = button_info.entity_category
         self._write_method = button_info.write_method
 
     @property

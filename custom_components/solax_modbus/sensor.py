@@ -8,7 +8,7 @@ from typing import Any, cast
 import homeassistant.util.dt as dt_util
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import CONF_NAME, PERCENTAGE, STATE_UNAVAILABLE, STATE_UNKNOWN, EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -27,10 +27,39 @@ from .const import (
     SLEEPMODE_NONE,
     SLEEPMODE_ZERO,
     BaseModbusSensorEntityDescription,
+    matches_modbus_protocol,
 )
 from .debug import get_debug_setting
 
 _LOGGER = logging.getLogger(__name__)
+
+
+COMMUNICATION_SENSOR_TYPES: list[BaseModbusSensorEntityDescription] = [
+    BaseModbusSensorEntityDescription(
+        name="Communication Health",
+        key="communication_health",
+        value_function=lambda initval, descr, datadict: datadict.get("communication_health", "Unknown"),
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:heart-pulse",
+    ),
+    BaseModbusSensorEntityDescription(
+        name="Communication Success Rate",
+        key="communication_success_rate",
+        value_function=lambda initval, descr, datadict: datadict.get("communication_success_rate"),
+        native_unit_of_measurement=PERCENTAGE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:percent-circle-outline",
+    ),
+    BaseModbusSensorEntityDescription(
+        name="Communication Quarantined Registers",
+        key="communication_quarantined_registers",
+        value_function=lambda initval, descr, datadict: datadict.get("communication_quarantined_registers", 0),
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:shield-alert-outline",
+    ),
+]
+
+COMMUNICATION_SENSOR_KEYS = {description.key for description in COMMUNICATION_SENSOR_TYPES}
 
 
 def _energy_dashboard_mapping_attrs(description: Any, hub: Any) -> dict[str, Any]:
@@ -144,6 +173,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         None,
         readFollowUp,
     )
+    for sensor_description in COMMUNICATION_SENSOR_TYPES:
+        entityToListSingle(
+            hub,
+            hub_name,
+            entities,
+            initial_groups,
+            computedRegs,
+            hub.device_info,
+            sensor_description,
+            None,
+            None,
+        )
 
     # Energy Dashboard check moved to after rebuild_blocks (see below) so initial_groups are ready for reading
 
@@ -227,12 +268,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     hub.computedSensors = computedRegs
     hub.rebuild_blocks(initial_groups)  # , computedRegs) # first time call
     _LOGGER.info(f"{hub.name}: computedRegs: {hub.computedSensors}")
-
-    # Give initial bisect task time to start before Energy Dashboard setup
-    # The bisect runs in background and may need a moment to begin
-    import asyncio
-
-    await asyncio.sleep(1.0)  # 1 second delay to let bisect task start
 
     # Energy Dashboard Virtual Device integration (after rebuild_blocks so initial_groups are ready for reading)
     try:
@@ -525,6 +560,17 @@ class SolaXModbusSensor(SensorEntity):
         # Skip hub registration for computed/internal sensors (those without modbus registers)
         # These sensors don't participate in the polling cycle
         if self.entity_description.register < 0:
+            if self.entity_description.value_function:
+                self._hub.computedSensors[self.entity_description.key] = self.entity_description
+                try:
+                    self._hub.data[self.entity_description.key] = self.entity_description.value_function(
+                        0,
+                        self.entity_description,
+                        self._hub.data,
+                    )
+                    self.modbus_data_updated()
+                except Exception as e:
+                    _LOGGER.debug(f"{self._platform_name}: value_function failed for {self.entity_description.key}: {e}")
             return
         await self._hub.async_add_solax_modbus_sensor(self)
 
@@ -545,6 +591,8 @@ class SolaXModbusSensor(SensorEntity):
     @property
     def name(self) -> str:
         """Return the name."""
+        if self.entity_description.key in COMMUNICATION_SENSOR_KEYS:
+            return str(self.entity_description.name or self.entity_description.key)
         return f"{self._platform_name} {self.entity_description.name}"
 
     @property
@@ -562,8 +610,18 @@ class SolaXModbusSensor(SensorEntity):
         return None
 
     @property
+    def should_poll(self) -> bool:
+        """Data is delivered by the hub."""
+        return False
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return self._attr_extra_state_attributes
+        attrs = dict(self._attr_extra_state_attributes)
+        if self.entity_description.key == "communication_health":
+            attrs.update(self._hub.communication_health_attributes())
+        elif self.entity_description.key == "communication_quarantined_registers":
+            attrs.update(self._hub.communication_quarantine_attributes())
+        return attrs
 
 
 class RiemannSumEnergySensor(SolaXModbusSensor, RestoreEntity):
@@ -735,7 +793,9 @@ def entityToList(
     readFollowUp: Any,
 ) -> None:  # noqa: D103
     for sensor_description in sensor_types:
-        if hub.plugin.matchInverterWithMask(hub._invertertype, sensor_description.allowedtypes, hub.seriesnumber, sensor_description.blacklist):
+        if hub.plugin.matchInverterWithMask(
+            hub._invertertype, sensor_description.allowedtypes, hub.seriesnumber, sensor_description.blacklist
+        ) and matches_modbus_protocol(hub, sensor_description):
             # apply scale exceptions early
             if sensor_description.value_series is not None:
                 for serie_value in range(sensor_description.value_series):
