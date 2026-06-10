@@ -100,22 +100,34 @@ def empty_input_device_group_lambda() -> SimpleNamespace:
     )
 
 
-def is_entity_enabled(hass: HomeAssistant, hub: Any, descriptor: Any, use_default: bool = False) -> bool:
+def is_entity_enabled(
+    hass: HomeAssistant,
+    hub: Any,
+    descriptor: Any,
+    use_default: bool = False,
+    platform_name: str | None = None,
+) -> bool:
     """Check if entity is enabled in registry."""
     # simple test, more complex counterpart is should_register_be_loaded
-    unique_id = f"{hub._name}_{descriptor.key}"
+    unique_id_prefix = platform_name or hub._name
+    unique_id = f"{unique_id_prefix}_{descriptor.key}"
     registry = er.async_get(hass)
     entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
     if entity_id:
         entity_entry = registry.async_get(entity_id)
-        if entity_entry and not entity_entry.disabled:
-            _LOGGER.debug(f"{hub.name}: is_entity_enabled: {entity_id} is enabled, returning True.")
-            return True  # Found an enabled entity, no need to check further
-    else:
-        _LOGGER.info(f"{hub.name}: entity {unique_id} not found in registry")
+        if entity_entry is None:
+            _LOGGER.debug(f"{hub.name}: is_entity_enabled: {entity_id} has no registry entry, returning False.")
+            return False
+        if entity_entry.disabled:
+            _LOGGER.debug(f"{hub.name}: is_entity_enabled: {entity_id} is disabled, returning False.")
+            return False
+        _LOGGER.debug(f"{hub.name}: is_entity_enabled: {entity_id} is enabled, returning True.")
+        return True  # Found an enabled entity, no need to check further
+
+    _LOGGER.info(f"{hub.name}: entity {unique_id} not found in registry")
     if use_default:
         _LOGGER.debug(
-            f"{hub.name}: is_entity_enabled: {entity_id} not found in registry, returning default {descriptor.entity_registry_enabled_default}."
+            f"{hub.name}: is_entity_enabled: {unique_id} not found in registry, returning default {descriptor.entity_registry_enabled_default}."
         )
         return bool(descriptor.entity_registry_enabled_default)
     return False
@@ -263,9 +275,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 readFollowUpBattery,
             )
 
+    hub.computedSensors = computedRegs
     async_add_entities(entities)
     # now the groups are available
-    hub.computedSensors = computedRegs
     hub.rebuild_blocks(initial_groups)  # , computedRegs) # first time call
     _LOGGER.info(f"{hub.name}: computedRegs: {hub.computedSensors}")
 
@@ -386,12 +398,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                         else:
                             start_time = time.time()
                             energy_dashboard_sensors = await create_energy_dashboard_sensors(hub, mapping, hass, config)
+                            energy_dashboard_entities = []
+                            energy_dashboard_platform_name = f"{hub_name} Energy Dashboard"
                             if energy_dashboard_sensors:
                                 _LOGGER.info(f"{hub_name}: Creating {len(energy_dashboard_sensors)} Energy Dashboard sensors")
-                                # Create a new list to track Energy Dashboard entities
-                                energy_dashboard_entities = []
-                                # Use Energy Dashboard device name as platform name for entity_id prefix
-                                energy_dashboard_platform_name = f"{hub_name} Energy Dashboard"
                                 entityToList(
                                     hub,
                                     energy_dashboard_platform_name,
@@ -416,18 +426,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                             _LOGGER.debug(
                                 f"{hub_name}: Energy Dashboard device creation completed in {elapsed_time:.3f}s ({len(energy_dashboard_entities)} entities)"
                             )
-
-                            # Ensure Energy Dashboard entities are enabled (they might have been disabled previously)
-                            entity_registry = er.async_get(hass)
-                            hub_unique_prefix = f"{hub._name}_"
-                            for sensor_mapping in mapping.mappings:
-                                unique_id = f"{hub_unique_prefix}{sensor_mapping.target_key}"
-                                entity_id = entity_registry.async_get_entity_id("sensor", DOMAIN, unique_id)
-                                if entity_id:
-                                    maybe_entry = entity_registry.async_get(entity_id)
-                                    if maybe_entry is not None and maybe_entry.disabled_by:
-                                        _LOGGER.debug(f"{hub_name}: Enabling previously disabled Energy Dashboard entity: {entity_id}")
-                                        entity_registry.async_update_entity(entity_id, disabled_by=None)
 
                         async def async_refresh_energy_dashboard_entities() -> None:
                             energy_dashboard_enabled = config.get(CONF_ENERGY_DASHBOARD_DEVICE, DEFAULT_ENERGY_DASHBOARD_DEVICE)
@@ -455,7 +453,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                             energy_dashboard_platform_name = f"{hub_name} Energy Dashboard"
                             for newdescr in energy_dashboard_sensors:
                                 existing_sensor = hub.sensorEntities.get(newdescr.key)
-                                if existing_sensor:
+                                if existing_sensor and getattr(existing_sensor, "hass", None) is not None:
+                                    hub.sensorDescriptions[newdescr.key] = newdescr
                                     existing_sensor.entity_description = newdescr
                                     if hasattr(existing_sensor, "_riemann_mapping") and getattr(newdescr, "_riemann_mapping", None):
                                         existing_sensor._riemann_mapping = newdescr._riemann_mapping
@@ -465,6 +464,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                                     if newdescr.register < 0 and newdescr.value_function:
                                         hub.computedSensors[newdescr.key] = newdescr
                                     continue
+                                if existing_sensor:
+                                    hub.sensorEntities.pop(newdescr.key, None)
+                                    hub.sensorDescriptions.pop(newdescr.key, None)
+                                    hub.computedSensors.pop(newdescr.key, None)
 
                                 entityToListSingle(
                                     hub,
@@ -499,7 +502,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
                             if allow_remove_pv or allow_remove_home or allow_remove_grid:
                                 entity_registry = er.async_get(hass)
-                                for key in list(hub.sensorEntities.keys()):
+                                existing_keys = set(hub.sensorEntities.keys()) | set(hub.sensorDescriptions.keys())
+                                for key in list(existing_keys):
                                     if key in desired_keys:
                                         continue
                                     is_pv_variant = "_pv_power_" in key or "_pv_energy_" in key
@@ -511,17 +515,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                                         if entity_id:
                                             entity_registry.async_remove(entity_id)
                                         hub.sensorEntities.pop(key, None)
+                                        hub.sensorDescriptions.pop(key, None)
                                         hub.computedSensors.pop(key, None)
 
                             # Recompute ED values immediately to relink unavailable entities.
                             for newdescr in energy_dashboard_sensors:
                                 if newdescr.register < 0 and newdescr.value_function:
+                                    sens = hub.sensorEntities.get(newdescr.key)
+                                    if sens is None and not getattr(newdescr, "internal", False):
+                                        continue
                                     try:
                                         hub.data[newdescr.key] = newdescr.value_function(0, newdescr, hub.data)
                                     except Exception as e:
                                         _LOGGER.debug(f"{hub_name}: ED refresh value_function failed for {newdescr.key}: {e}")
                                         continue
-                                    sens = hub.sensorEntities.get(newdescr.key)
                                     if sens and not getattr(newdescr, "internal", False):
                                         sens.modbus_data_updated()
 
@@ -555,8 +562,18 @@ class SolaXModbusSensor(SensorEntity):
         self.entity_description: BaseModbusSensorEntityDescription = description
         self._attr_extra_state_attributes = _energy_dashboard_mapping_attrs(self.entity_description, self._hub)
 
+    def _register_hub_sensor_entity(self) -> None:
+        # Only called from async_added_to_hass so disabled entities never enter sensorEntities.
+        self._hub.sensorEntities[self.entity_description.key] = self
+        self._hub.sensorDescriptions[self.entity_description.key] = self.entity_description
+
+    def _unregister_hub_sensor_entity(self) -> None:
+        if self._hub.sensorEntities.get(self.entity_description.key) is self:
+            self._hub.sensorEntities.pop(self.entity_description.key, None)
+
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
+        self._register_hub_sensor_entity()
         # Skip hub registration for computed/internal sensors (those without modbus registers)
         # These sensors don't participate in the polling cycle
         if self.entity_description.register < 0:
@@ -575,7 +592,11 @@ class SolaXModbusSensor(SensorEntity):
         await self._hub.async_add_solax_modbus_sensor(self)
 
     async def async_will_remove_from_hass(self) -> None:
-        await self._hub.async_remove_solax_modbus_sensor(self)
+        if self.entity_description.register >= 0 or getattr(self.entity_description, "_is_riemann_sum_sensor", False):
+            await self._hub.async_remove_solax_modbus_sensor(self)
+        if self.entity_description.register < 0 and not getattr(self.entity_description, "_is_riemann_sum_sensor", False):
+            self._hub.computedSensors.pop(self.entity_description.key, None)
+        self._unregister_hub_sensor_entity()
 
     @callback
     def modbus_data_updated(self) -> None:
@@ -695,6 +716,7 @@ class RiemannSumEnergySensor(SolaXModbusSensor, RestoreEntity):
             self.async_write_ha_state()
 
         # Register with hub
+        self._register_hub_sensor_entity()
         await self._hub.async_add_solax_modbus_sensor(self)
 
     @callback
@@ -870,7 +892,7 @@ def entityToListSingle(
             newdescr,
         )
 
-    hub.sensorEntities[newdescr.key] = sensor
+    hub.sensorDescriptions[newdescr.key] = newdescr
     # register dependency chain
     deplist = newdescr.depends_on
     if deplist is not None:
@@ -886,13 +908,10 @@ def entityToListSingle(
     if newdescr.sleepmode == SLEEPMODE_ZERO:
         hub.sleepzero.append(newdescr.key)
     if newdescr.register < 0:  # entity without modbus address
-        enabled = is_entity_enabled(hub._hass, hub, newdescr, use_default=True)  # dont compute disabled entities anymore
-        # if not enabled: _LOGGER.info(f"is_entity_enabled called for disabled entity {newdescr.key}")
-        if newdescr.value_function and (enabled or newdescr.internal):  # *** dont compute disabled entities anymore unless internal
+        if newdescr.value_function and newdescr.internal:
             computedRegs[newdescr.key] = newdescr
-        else:
-            if enabled:
-                _LOGGER.warning(f"{hub_name}: entity without modbus register address and without value_function found: {newdescr.key}")
+        elif not newdescr.value_function and is_entity_enabled(hub._hass, hub, newdescr, use_default=True, platform_name=hub_name):
+            _LOGGER.warning(f"{hub_name}: entity without modbus register address and without value_function found: {newdescr.key}")
     else:
         # target group
         interval_group = groups.setdefault(hub.scan_group(sensor), empty_input_interval_group_lambda())

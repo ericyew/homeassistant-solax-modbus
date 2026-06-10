@@ -20,7 +20,6 @@ from homeassistant.const import (
     CONF_HOST,
     CONF_NAME,
     CONF_PORT,
-    EVENT_HOMEASSISTANT_STARTED,
     EVENT_HOMEASSISTANT_STOP,
     PERCENTAGE,
     Platform,
@@ -414,19 +413,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "hub": hub,
     }
 
-    # Tests on some systems have shown that establishing the Modbus connection
-    # can occasionally lead to errors if Home Assistant is not fully loaded.
-    if hass.is_running:
-        # Start init in background so it can be cancelled on unload
-        hub._init_task = hass.loop.create_task(hub.async_init())
-    else:
-        # Defer until HA is started, but still capture the task handle for cancellation
-        async def _deferred_init(event: Any) -> None:
-            if getattr(hub, "_stopping", False):
-                return
-            hub._init_task = hass.loop.create_task(hub.async_init())
-
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _deferred_init)
+    await hub.async_init()
 
     entry.async_on_unload(entry.add_update_listener(config_entry_update_listener))
     return True
@@ -567,6 +554,7 @@ class SolaXModbusHub:
         self.computedSensors: dict[Any, Any] = {}
         self.computedEntities: dict[Any, Any] = {}  # buttons and selects with value_function for autorepeat
         self.computedSwitches: dict[Any, Any] = {}
+        self.sensorDescriptions: dict[Any, Any] = {}  # all sensor descriptions, indexed by key
         self.sensorEntities: dict[Any, Any] = {}  # all sensor entities, indexed by key
         self.numberEntities: dict[Any, Any] = {}  # all number entities, indexed by key
         self.selectEntities: dict[Any, Any] = {}
@@ -590,6 +578,8 @@ class SolaXModbusHub:
         self.config: Any = config  # MappingProxyType from entry.options
         self.entry: ConfigEntry = entry
         self.device_info: DeviceInfo | None = None
+        self.inverter_model: str | None = None
+        self._has_local_inverter_model: bool = False
         self.blocks_changed: bool = False
         self.initial_groups: dict[Any, Any] = {}  # as returned by the sensor setup - holdingRegs and inputRegs should not change
 
@@ -691,7 +681,7 @@ class SolaXModbusHub:
         self.device_info = DeviceInfo(
             identifiers=cast(set[tuple[str, str]], {(DOMAIN, self._name, INVERTER_IDENT)}),
             manufacturer=self.plugin.plugin_manufacturer,
-            model=getattr(self.plugin, "inverter_model", None),
+            model=self._get_inverter_model(),
             name=plugin_name,
             serial_number=self.seriesnumber,
             sw_version=self.plugin.getSoftwareVersion(self.data),
@@ -722,6 +712,11 @@ class SolaXModbusHub:
 
         self._init_task = None
 
+    def _get_inverter_model(self) -> str | None:
+        if self._has_local_inverter_model:
+            return self.inverter_model
+        return getattr(self.plugin, "inverter_model", None)
+
     async def _deferred_setup_loop(self, interval: int = 30) -> None:
         """Keep trying to detect inverter type and forward platforms once online."""
         import asyncio
@@ -743,7 +738,7 @@ class SolaXModbusHub:
                     self.device_info = DeviceInfo(
                         identifiers=cast(set[tuple[str, str]], {(DOMAIN, self._name, INVERTER_IDENT)}),
                         manufacturer=self.plugin.plugin_manufacturer,
-                        model=getattr(self.plugin, "inverter_model", None),
+                        model=self._get_inverter_model(),
                         name=plugin_name,
                         serial_number=self.seriesnumber,
                         sw_version=self.plugin.getSoftwareVersion(self.data),
@@ -1735,11 +1730,14 @@ class SolaXModbusHub:
             self.plugin.localDataCallback(self)
         if not self.localsLoaded:
             await self._hass.async_add_executor_job(self.loadLocalData)
-        for key, descr in self.computedSensors.items():
-            # Do NOT call modbus_data_updated() from here Race Condition:it calls hub.rebuild_blocks() before async_add_entities is called.
-            data[key] = descr.value_function(0, descr, data)
-            sens = self.sensorEntities[key]
-            _LOGGER.debug(f"{self._name}: quickly updating state for computed sensor {sens} {key} {data[descr.key]} ")
+        for key, descr in list(self.computedSensors.items()):
+            try:
+                data[key] = descr.value_function(0, descr, data)
+            except Exception as ex:
+                _LOGGER.debug(f"{self._name}: cannot compute value for {key}: {ex}")
+                continue
+            sens = self.sensorEntities.get(key)
+            _LOGGER.debug(f"{self._name}: quickly updating state for computed sensor {sens} {key} {data.get(descr.key)} ")
             if sens and (not descr.internal):
                 try:
                     sens.modbus_data_updated()  # publish state to GUI and automations faster - assuming enabled, otherwise exception
@@ -1829,6 +1827,8 @@ class SolaXModbusHub:
                 control_entity = self.sensorEntities.get(control_key)
                 if control_entity:
                     control_descr = control_entity.entity_description
+            if not control_descr:
+                control_descr = self.sensorDescriptions.get(control_key)
             if control_descr and should_register_be_loaded(self._hass, self, control_descr):
                 _LOGGER.debug(f"Sensor '{sensor_key}' is required by enabled control or value_function entity '{control_key}'.")
                 return True

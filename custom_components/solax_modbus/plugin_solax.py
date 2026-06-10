@@ -473,7 +473,9 @@ def autorepeat_function_remotecontrol_recompute(initval: int, descr: Any, datadi
             ap_target = 0 - pv_power
         power_control = "Enabled Power Control"
 
-    elif power_control == "Disabled":
+    else:
+        # Otherwise disabled or unknown mode. Mark as disabled.
+        power_control = "Disabled"
         ap_target = target
 
     # Debug logging: Target calculation
@@ -1056,7 +1058,9 @@ def autorepeat_function_powercontrolmode8_recompute(initval: int, descr: Any, da
     elif power_control == "Enabled Grid Control":
         pushmode_power = pushmode_power + houseload - pv
         pvlimit = setpvlimit
-    elif power_control == "Disabled":
+    else:
+        # Otherwise disabled or unknown mode. Mark as disabled.
+        power_control = "Disabled"
         pvlimit = setpvlimit
     # limit import to max import (capacity tarif in some countries)
     old_pushmode_power = pushmode_power
@@ -11300,6 +11304,7 @@ class solax_plugin(plugin_base):
     async def async_determineInverterType(self, hub: Any, configdict: dict[str, Any]) -> int:
         # global SENSOR_TYPES
         _LOGGER.info(f"{hub.name}: trying to determine inverter type")
+        self.inverter_model = None
         seriesnumber = await async_read_serialnr(hub, 0x0)
         if not seriesnumber:
             seriesnumber = await async_read_serialnr(hub, 0x300)  # bug in Endian.LITTLE decoding?
@@ -11685,6 +11690,9 @@ class solax_plugin(plugin_base):
             invertertype = 0
             _LOGGER.error(f"unrecognized inverter type - serial number : {seriesnumber}")
 
+        hub.inverter_model = self.inverter_model if invertertype > 0 else None
+        hub._has_local_inverter_model = True
+
         if invertertype > 0:
             # Firmware metadata is needed before the first poll so the device registry and
             # protocol-specific register filters start with the right values.
@@ -11787,7 +11795,13 @@ class solax_plugin(plugin_base):
                         )
                         _LOGGER.info(f"Parallel Master: Set {key} limits to ±{system_limit_w}W (inverter_power_kw={hub.inverterPowerKw}kW)")
 
-        # For single inverters or if config_max_export is enabled, use config_max_export
+        # For single inverters or if config_max_export is enabled, use config_max_export.
+        # Parallel Master remote-control limits are handled above using total system power,
+        # but export_control_user_limit still needs the configured max export range.
+        parallel_master_remotecontrol_keys = {
+            "remotecontrol_active_power",
+            "remotecontrol_import_limit",
+        }
         config_maxexport_entity = hub.numberEntities.get("config_max_export")
         if config_maxexport_entity and config_maxexport_entity.enabled:
             new_max_export = hub.data.get("config_max_export")
@@ -11799,14 +11813,17 @@ class solax_plugin(plugin_base):
                     "generator_max_charge",
                 ]:
                     number_entity = hub.numberEntities.get(key)
-                    if number_entity and parallel_setting != "Master":  # Don't override parallel Master
-                        number_entity._attr_native_max_value = new_max_export
-                        # update description also, not sure whether needed or not
-                        number_entity.entity_description = replace(
-                            number_entity.entity_description,
-                            native_max_value=new_max_export,
-                        )
-                        _LOGGER.info(f"local data update callback for entity: {key} new limit: {new_max_export}")
+                    if not number_entity:
+                        continue
+                    if parallel_setting == "Master" and key in parallel_master_remotecontrol_keys:
+                        continue
+                    number_entity._attr_native_max_value = new_max_export
+                    # update description also, not sure whether needed or not
+                    number_entity.entity_description = replace(
+                        number_entity.entity_description,
+                        native_max_value=new_max_export,
+                    )
+                    _LOGGER.info(f"local data update callback for entity: {key} new limit: {new_max_export}")
 
         return False
 
