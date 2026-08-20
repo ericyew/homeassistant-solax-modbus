@@ -2,7 +2,11 @@ name: Sync fork with upstream release
 
 # GitHub can't fire a webhook into this fork when the upstream repo
 # publishes a release, so this polls upstream on a schedule: fast-forwards
-# main, mirrors its tags, and mirrors its Release entries (title + notes).
+# main, mirrors recent release tags, and mirrors Release entries (title +
+# notes). Tag pushes are scoped to recent releases only (not `--tags`),
+# since brand-new tag refs are pushed as their whole tree from scratch and
+# some ancient upstream tags contain workflow files GITHUB_TOKEN can't
+# push without the `workflow` OAuth scope, which it doesn't have.
 
 on:
   schedule:
@@ -11,7 +15,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 env:
   UPSTREAM_REPO: wills106/homeassistant-solax-modbus
@@ -43,17 +46,27 @@ jobs:
           git merge --ff-only upstream/main
           git push origin main
 
-      - name: Push upstream tags
-        run: git push origin --tags
-
-      - name: Mirror missing GitHub Release entries
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Fetch recent upstream releases
         run: |
           curl -sf "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=15" \
             | jq -c '[.[] | select(.draft==false)] | sort_by(.created_at) | .[]' \
             > /tmp/upstream-releases.jsonl
 
+      - name: Push recent release tags
+        run: |
+          while IFS= read -r rel; do
+            tag=$(jq -r '.tag_name' <<<"$rel")
+            if git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
+              git push origin "refs/tags/$tag"
+            else
+              echo "Tag $tag not fetched from upstream, skipping"
+            fi
+          done < /tmp/upstream-releases.jsonl
+
+      - name: Mirror missing GitHub Release entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           while IFS= read -r rel; do
             tag=$(jq -r '.tag_name' <<<"$rel")
             title=$(jq -r '.name // .tag_name' <<<"$rel")
