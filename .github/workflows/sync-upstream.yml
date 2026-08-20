@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  workflows: write
 
 env:
   UPSTREAM_REPO: wills106/homeassistant-solax-modbus
