@@ -62,4 +62,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git merge --ff-only upstream/main
           git push origin main
-          echo "Synced main to upstream release ${{ steps.release.outputs.tag }}"
+          git push origin --tags
+          echo "Synced main and tags to upstream release ${{ steps.release.outputs.tag }}"
