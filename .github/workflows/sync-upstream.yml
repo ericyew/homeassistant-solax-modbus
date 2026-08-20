@@ -1,0 +1,65 @@
+name: Sync fork with upstream release
+
+# GitHub can't fire a webhook into this fork when the upstream repo
+# publishes a release, so this polls upstream's "latest release" API on a
+# schedule and fast-forwards main whenever it finds a release we don't
+# have yet.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # every 6 hours
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: wills106/homeassistant-solax-modbus
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'ericyew/homeassistant-solax-modbus'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Get latest upstream release tag
+        id: release
+        run: |
+          tag=$(curl -sf "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" | jq -r '.tag_name')
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "Could not determine latest upstream release" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream --tags
+
+      - name: Check if that release is already merged
+        id: check
+        run: |
+          if git merge-base --is-ancestor "${{ steps.release.outputs.tag }}" main; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fast-forward main to upstream and push
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git merge --ff-only upstream/main
+          git push origin main
+          echo "Synced main to upstream release ${{ steps.release.outputs.tag }}"
