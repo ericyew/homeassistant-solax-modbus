@@ -1,5 +1,4 @@
 import logging
-from dataclasses import replace
 from datetime import datetime
 from datetime import time as datetime_time
 from typing import Any
@@ -35,17 +34,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     hub = hass.data[DOMAIN][hub_name]["hub"]
 
     plugin = hub.plugin  # getPlugin(hub_name)
-    inverter_name_suffix = ""
-    if hub.inverterNameSuffix is not None and hub.inverterNameSuffix != "":
-        inverter_name_suffix = hub.inverterNameSuffix + " "
-
     entities = []
     for time_info in plugin.TIME_TYPES:
         if plugin.matchInverterWithMask(hub._invertertype, time_info.allowedtypes, hub.seriesnumber, time_info.blacklist) and matches_modbus_protocol(
             hub, time_info
         ):
-            if not (time_info.name.startswith(inverter_name_suffix)):
-                time_info = replace(time_info, name=inverter_name_suffix + time_info.name)
             time_entity = SolaXModbusTimeEntity(hub_name, hub, modbus_addr, hub.device_info, time_info)
             if time_info.write_method == WRITE_DATA_LOCAL:
                 if time_info.initvalue is not None:
@@ -60,6 +53,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class SolaXModbusTimeEntity(TimeEntity):
     """Representation of an SolaX Modbus time entity."""
 
+    _attr_has_entity_name = True
     entity_description: BaseModbusTimeEntityDescription
 
     def __init__(
@@ -115,6 +109,24 @@ class SolaXModbusTimeEntity(TimeEntity):
             return
         self.modbus_data_updated()
 
+    def _parse_time_string(self, time_val: str) -> datetime_time | None:
+        """Parse common time string formats into a datetime.time object."""
+        time_val = time_val.strip()
+        if not time_val:
+            _LOGGER.debug(f"{self._platform_name}: empty time string for {self._key}")
+            return None
+
+        for fmt in ["%H:%M", "%H:%M:%S", "%H:%M:%S.%f"]:
+            try:
+                parsed = datetime.strptime(time_val, fmt)
+                _LOGGER.debug(f"{self._platform_name}: parsed {self._key} as {fmt}: {parsed.time()}")
+                return parsed.time()
+            except ValueError:
+                continue
+
+        _LOGGER.debug(f"{self._platform_name}: unrecognized time format for {self._key}: {time_val}")
+        return None
+
     def _parse_time_value(self) -> datetime_time | None:
         """Parse the time value from hub.data and return a datetime.time object.
 
@@ -136,57 +148,17 @@ class SolaXModbusTimeEntity(TimeEntity):
 
         # Handle string time values in hh:mm format
         if isinstance(time_val, str):
-            # Strip whitespace and handle empty strings
-            time_val = time_val.strip()
-            if not time_val:
-                _LOGGER.debug(f"{self._platform_name}: empty time string for {self._key}")
-                return None
-            # Common time formats
-            for fmt in ["%H:%M", "%H:%M:%S", "%H:%M:%S.%f"]:
-                try:
-                    parsed = datetime.strptime(time_val, fmt)
-                    _LOGGER.debug(f"{self._platform_name}: parsed {self._key} as {fmt}: {parsed.time()}")
-                    return parsed.time()
-                except ValueError:
-                    continue
-            # Try parsing as HH:MM:SS with seconds (8 chars like 05:25:30)
-            if len(time_val) == 8 and time_val[2] == ":" and time_val[5] == ":":
-                try:
-                    parsed = datetime.strptime(time_val, "%H:%M:%S")
-                    _LOGGER.debug(f"{self._platform_name}: parsed {self._key} as HH:MM:SS: {parsed.time()}")
-                    return parsed.time()
-                except ValueError:
-                    pass
-            # Try parsing as HH:MM (5 chars like 05:25)
-            if len(time_val) == 5 and time_val[2] == ":":
-                try:
-                    parsed = datetime.strptime(time_val, "%H:%M")
-                    _LOGGER.debug(f"{self._platform_name}: parsed {self._key} as HH:MM: {parsed.time()}")
-                    return parsed.time()
-                except ValueError:
-                    pass
-            # If we get here, the string format was not recognized
-            _LOGGER.debug(f"{self._platform_name}: unrecognized time format for {self._key}: {time_val}")
-            return None
+            return self._parse_time_string(time_val)
 
-        # Handle numeric values (e.g., from value_function_gen4time or value_function_gen23time)
+        # Handle raw Modbus payloads by translating through the descriptor's option table.
         if isinstance(time_val, (int, float)):
-            # Try to convert to string and parse
-            time_str = str(time_val)
-            if len(time_str) == 5 and time_str[2] == ":":
-                try:
-                    parsed = datetime.strptime(time_str, "%H:%M")
-                    _LOGGER.debug(f"{self._platform_name}: parsed numeric {self._key} as HH:MM: {parsed.time()}")
-                    return parsed.time()
-                except ValueError:
-                    pass
-            if len(time_str) == 8 and time_str[2] == ":" and time_str[5] == ":":
-                try:
-                    parsed = datetime.strptime(time_str, "%H:%M:%S")
-                    _LOGGER.debug(f"{self._platform_name}: parsed numeric {self._key} as HH:MM:SS: {parsed.time()}")
-                    return parsed.time()
-                except ValueError:
-                    pass
+            payload = int(time_val)
+            if self._option_dict is not None:
+                mapped_value = self._option_dict.get(payload)
+                if mapped_value is not None:
+                    return self._parse_time_string(mapped_value)
+            _LOGGER.debug(f"{self._platform_name}: no time option mapping for {self._key} payload {payload}")
+            return None
 
         _LOGGER.debug(f"{self._platform_name}: time value for {self._key} is not a string or datetime: {type(time_val)}")
         return None
@@ -202,14 +174,14 @@ class SolaXModbusTimeEntity(TimeEntity):
         return self._attr_native_value
 
     @property
-    def name(self) -> str:
-        """Return the name."""
-        return f"{self._platform_name} {self._name}"
-
-    @property
     def should_poll(self) -> bool:
         """Data is delivered by by the hub"""
         return False
+
+    @property
+    def name(self) -> str:
+        """Return the entity name (description name only — the device name provides context)."""
+        return str(self._name or self._key)
 
     @property
     def unique_id(self) -> str | None:
@@ -225,7 +197,7 @@ class SolaXModbusTimeEntity(TimeEntity):
 
         # Find the corresponding payload from option_dict
         payload = None
-        for key, time_val in self._option_dict.items():
+        for key, time_val in (self._option_dict or {}).items():
             if time_val == time_str:
                 payload = key
                 break
@@ -259,8 +231,9 @@ class SolaXModbusTimeEntity(TimeEntity):
         elif self._write_method == WRITE_DATA_LOCAL:
             _LOGGER.info(f"*** local data written {self._key}: {time_str}")
             self._hub.localsUpdated = True  # mark to save permanently
-            self._hub.data[self._key] = time_str
 
+        self._hub.data[self._key] = time_str
+        self._attr_native_value = value
         self.async_write_ha_state()
 
     async def async_set_time(self, time_val: datetime_time) -> None:

@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
@@ -464,7 +464,7 @@ NUMBER_TYPES = [
         native_min_value=0,
         native_max_value=21600,
         native_step=1,
-        allowedtypes=HYBRID | X3 | EPS,
+        allowedtypes=HYBRID | EPS,
         prevent_update=True,
         write_method=WRITE_DATA_LOCAL,
         entity_registry_enabled_default=False,
@@ -580,7 +580,19 @@ SELECT_TYPES = [
             1: "Enabled - Feed-in limitation",
             2: "Enabled - 3-phase limit",
         },
-        allowedtypes=HYBRID | PV,
+        allowedtypes=HYBRID | PV | X3,
+        write_method=WRITE_DATA_LOCAL,
+        icon="mdi:transmission-tower-import",
+    ),
+    SofarModbusSelectEntityDescription(
+        name="FeedIn: Limitation Mode",
+        key="feedin_limitation_mode",
+        register_data_type=REGISTER_U16,
+        option_dict={
+            0: "Disabled",
+            1: "Enabled - Feed-in limitation",
+        },
+        allowedtypes=HYBRID | PV | X1,
         write_method=WRITE_DATA_LOCAL,
         icon="mdi:transmission-tower-import",
     ),
@@ -720,7 +732,7 @@ SELECT_TYPES = [
             1: "Turn On, Prohibit Cold Start",
             2: "Turn On, Enable Cold Start",
         },
-        allowedtypes=HYBRID | X3 | EPS,
+        allowedtypes=HYBRID | EPS,
         icon="mdi:power-plug-off",
     ),
     # Does not work. 0x1035, 0x1036, and 0x1037 have to be written in one single chunk
@@ -771,7 +783,23 @@ SELECT_TYPES = [
             6: "Generator mode",
             7: "Feed-In Priority Mode",
         },
-        allowedtypes=HYBRID,
+        allowedtypes=HYBRID | X3,
+        write_method=WRITE_MULTISINGLE_MODBUS,
+        icon="mdi:battery-charging-60",
+    ),
+    SofarModbusSelectEntityDescription(
+        name="Energy Storage Mode",
+        key="charger_use_mode",
+        register=0x1110,
+        option_dict={
+            0: "Self Use",
+            1: "Time of Use",
+            2: "Timing Mode",
+            3: "Passive Mode",
+            4: "Peak Cut Mode",
+            5: "Off-grid Mode",
+        },
+        allowedtypes=HYBRID | X1,
         write_method=WRITE_MULTISINGLE_MODBUS,
         icon="mdi:battery-charging-60",
     ),
@@ -1195,7 +1223,7 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         key="software_version",
         register=0x44F,
         register_data_type=REGISTER_STR,
-        wordcount=12,
+        wordcount=4,
         entity_category=EntityCategory.DIAGNOSTIC,
         allowedtypes=HYBRID | PV,
     ),
@@ -1761,11 +1789,10 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         register=0x504,
-        # newblock = True,
         register_data_type=REGISTER_S16,
         scale=0.01,
         rounding=2,
-        allowedtypes=HYBRID | X3 | EPS,
+        allowedtypes=HYBRID | EPS,
     ),
     SofarModbusSensorEntityDescription(
         name="Reactive Power Off-Grid Total",
@@ -1777,7 +1804,7 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         scale=0.01,
         rounding=2,
         entity_registry_enabled_default=False,
-        allowedtypes=HYBRID | X3 | EPS,
+        allowedtypes=HYBRID | EPS,
     ),
     SofarModbusSensorEntityDescription(
         name="Apparent Power Off-Grid Total",
@@ -1789,7 +1816,7 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         register_data_type=REGISTER_S16,
         scale=0.01,
         rounding=2,
-        allowedtypes=HYBRID | X3 | EPS,
+        allowedtypes=HYBRID | EPS,
     ),
     SofarModbusSensorEntityDescription(
         name="Off-Grid Frequency",
@@ -1799,7 +1826,18 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         register=0x507,
         scale=0.01,
         rounding=2,
-        allowedtypes=HYBRID | X3 | EPS,
+        allowedtypes=HYBRID | EPS,
+    ),
+    SofarModbusSensorEntityDescription(
+        name="Off-Grid Voltage",
+        key="offgrid_voltage",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        register=0x50A,
+        scan_group=SCAN_GROUP_FAST,
+        scale=0.1,
+        rounding=1,
+        allowedtypes=HYBRID | X1 | EPS,
     ),
     SofarModbusSensorEntityDescription(
         name="Off-Grid Voltage L1",
@@ -1813,6 +1851,17 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         allowedtypes=HYBRID | X3 | EPS,
     ),
     SofarModbusSensorEntityDescription(
+        name="Off-Grid Current Output",
+        key="offgrid_current_output",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        register=0x50B,
+        register_data_type=REGISTER_S16,
+        scale=0.01,
+        rounding=2,
+        allowedtypes=HYBRID | X1 | EPS,
+    ),
+    SofarModbusSensorEntityDescription(
         name="Off-Grid Current Output L1",
         key="offgrid_current_output_l1",
         native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
@@ -1824,6 +1873,17 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         allowedtypes=HYBRID | X3 | EPS,
     ),
     SofarModbusSensorEntityDescription(
+        name="Off-Grid Active Power Output",
+        key="offgrid_active_power_output",
+        native_unit_of_measurement=UnitOfPower.KILO_WATT,
+        device_class=SensorDeviceClass.POWER,
+        register=0x50C,
+        register_data_type=REGISTER_S16,
+        scale=0.01,
+        rounding=2,
+        allowedtypes=HYBRID | X1 | EPS,
+    ),
+    SofarModbusSensorEntityDescription(
         name="Off-Grid Active Power Output L1",
         key="offgrid_active_power_output_l1",
         native_unit_of_measurement=UnitOfPower.KILO_WATT,
@@ -1833,6 +1893,18 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         scale=0.01,
         rounding=2,
         allowedtypes=HYBRID | X3 | EPS,
+    ),
+    SofarModbusSensorEntityDescription(
+        name="Off-Grid Reactive Power Output",
+        key="offgrid_reactive Power_output",
+        native_unit_of_measurement=UnitOfReactivePower.VOLT_AMPERE_REACTIVE,
+        device_class=SensorDeviceClass.REACTIVE_POWER,
+        register=0x50D,
+        register_data_type=REGISTER_S16,
+        scale=0.01,
+        rounding=2,
+        entity_registry_enabled_default=False,
+        allowedtypes=HYBRID | X1 | EPS,
     ),
     SofarModbusSensorEntityDescription(
         name="Off-Grid Reactive Power Output L1",
@@ -1847,6 +1919,17 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         allowedtypes=HYBRID | X3 | EPS,
     ),
     SofarModbusSensorEntityDescription(
+        name="Off-Grid Apparent Power Output",
+        key="offgrid_apparent_power_output",
+        native_unit_of_measurement=UnitOfApparentPower.VOLT_AMPERE,
+        device_class=SensorDeviceClass.APPARENT_POWER,
+        register=0x50E,
+        register_data_type=REGISTER_S16,
+        scale=0.01,
+        rounding=2,
+        allowedtypes=HYBRID | X1 | EPS,
+    ),
+    SofarModbusSensorEntityDescription(
         name="Off-Grid Apparent Power Output L1",
         key="offgrid_apparent_power_output_l1",
         native_unit_of_measurement=UnitOfApparentPower.VOLT_AMPERE,
@@ -1856,6 +1939,16 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         scale=0.01,
         rounding=2,
         allowedtypes=HYBRID | X3 | EPS,
+    ),
+    SofarModbusSensorEntityDescription(
+        name="Off-Grid LoadPeakRatio",
+        key="offgrid_loadpeakratio",
+        native_unit_of_measurement=UnitOfApparentPower.VOLT_AMPERE,
+        device_class=SensorDeviceClass.APPARENT_POWER,
+        register=0x50F,
+        scale=0.01,
+        rounding=2,
+        allowedtypes=HYBRID | X1 | EPS,
     ),
     SofarModbusSensorEntityDescription(
         name="Off-Grid LoadPeakRatio L1",
@@ -3249,7 +3342,7 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
             2: "Turn On, Enable Cold Start",
         },
         entity_registry_enabled_default=False,
-        allowedtypes=HYBRID | X3 | EPS,
+        allowedtypes=HYBRID | EPS,
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     SofarModbusSensorEntityDescription(
@@ -3257,7 +3350,7 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         key="passive_eps_wait_time",
         register=0x102A,
         entity_registry_enabled_default=False,
-        allowedtypes=HYBRID | X3 | EPS,
+        allowedtypes=HYBRID | EPS,
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     SofarModbusSensorEntityDescription(
@@ -3888,6 +3981,7 @@ BATTERY_SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         device_class=SensorDeviceClass.VOLTAGE,
         register=0x9051,
+        suggested_display_precision=3,
         scale=0.001,
         rounding=3,
         allowedtypes=BAT_BTS,
@@ -3899,6 +3993,7 @@ BATTERY_SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         device_class=SensorDeviceClass.VOLTAGE,
         register=0x9069,
+        suggested_display_precision=3,
         scale=0.001,
         rounding=3,
         allowedtypes=BAT_BTS,
@@ -3909,6 +4004,7 @@ BATTERY_SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         device_class=SensorDeviceClass.VOLTAGE,
         register=0x906A,
+        suggested_display_precision=3,
         scale=0.001,
         rounding=3,
         allowedtypes=BAT_BTS,
@@ -4273,6 +4369,22 @@ class sofar_plugin(plugin_base):
 
     def getHardwareVersion(self, new_data: dict[str, Any]) -> str | None:
         return new_data.get("hardware_version", None)
+
+    def localDataCallback(self, hub: Any) -> bool:
+        parallel_setting = hub.data.get("parallel_masterslave", "Slave")
+        if parallel_setting == "Master":
+            system_limit_w = hub.inverterPowerKw * 1000
+            number_entity = hub.numberEntities.get("feedin_max_power")
+            if number_entity:
+                number_entity._attr_native_min_value = 0
+                number_entity._attr_native_max_value = system_limit_w
+                number_entity.entity_description = replace(
+                    number_entity.entity_description,
+                    native_min_value=0,
+                    native_max_value=system_limit_w,
+                )
+                _LOGGER.info(f"Parallel Master: Set feedin_max_power limit to 0-{system_limit_w}W (inverter_power_kw={hub.inverterPowerKw}kW)")
+        return True
 
 
 plugin_instance = sofar_plugin(

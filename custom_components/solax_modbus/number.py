@@ -27,6 +27,11 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _scale_native_value_to_register(value: float, scale: float, read_scale: float) -> int:
+    """Convert a native number value to its integer register representation."""
+    return int(round(value / (scale * read_scale)))
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> bool:
     if entry.data:  # old style - remove soon
         hub_name = entry.data[CONF_NAME]
@@ -37,10 +42,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     hub = hass.data[DOMAIN][hub_name]["hub"]
 
     plugin = hub.plugin  # getPlugin(hub_name)
-    inverter_name_suffix = ""
-    if hub.inverterNameSuffix is not None and hub.inverterNameSuffix != "":
-        inverter_name_suffix = hub.inverterNameSuffix + " "
-
     entities = []
     for number_info in plugin.NUMBER_TYPES:
         newdescr = number_info
@@ -54,9 +55,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         if plugin.matchInverterWithMask(hub._invertertype, newdescr.allowedtypes, hub.seriesnumber, newdescr.blacklist) and matches_modbus_protocol(
             hub, newdescr
         ):
-            if not (newdescr.name.startswith(inverter_name_suffix)):
-                newdescr = replace(newdescr, name=inverter_name_suffix + newdescr.name)
-
             number = SolaXModbusNumber(hub_name, hub, modbus_addr, hub.device_info, newdescr)
             if newdescr.write_method == WRITE_DATA_LOCAL:
                 hub.writeLocals[newdescr.key] = newdescr
@@ -90,6 +88,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class SolaXModbusNumber(NumberEntity):
     """Representation of an SolaX Modbus number."""
 
+    _attr_has_entity_name = True
     entity_description: BaseModbusNumberEntityDescription
 
     def __init__(
@@ -123,6 +122,13 @@ class SolaXModbusNumber(NumberEntity):
             ) in number_info.max_exceptions:
                 if hub.seriesnumber.startswith(prefix):
                     self._attr_native_max_value = native_value
+        if number_info.min_exceptions:
+            for (
+                prefix,
+                native_value,
+            ) in number_info.min_exceptions:
+                if hub.seriesnumber.startswith(prefix):
+                    self._attr_native_min_value = native_value
         if number_info.min_exceptions_minus:
             for (
                 prefix,
@@ -178,8 +184,8 @@ class SolaXModbusNumber(NumberEntity):
 
     @property
     def name(self) -> str:
-        """Return the name."""
-        return f"{self._platform_name} {self._name}"
+        """Return the entity name (description name only — the device name provides context)."""
+        return str(self._name or self._key)
 
     @property
     def unique_id(self) -> str | None:
@@ -235,10 +241,8 @@ class SolaXModbusNumber(NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         """Change the number value."""
         payload: int | float = value
-        if self._fmt == "i":
-            payload = int(value / (self._attr_scale * self.entity_description.read_scale))
-        elif self._fmt == "f":
-            payload = int(value / (self._attr_scale * self.entity_description.read_scale))
+        if self._fmt in ("i", "f"):
+            payload = _scale_native_value_to_register(value, self._attr_scale, self.entity_description.read_scale)
         if self._write_method == WRITE_MULTISINGLE_MODBUS:
             _LOGGER.info(
                 f"writing {self._platform_name} {self._key} number register {self._register} value {payload} after div by readscale {self.entity_description.read_scale} scale {self._attr_scale} with mode {self._write_method}"
