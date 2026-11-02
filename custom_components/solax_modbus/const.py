@@ -83,6 +83,9 @@ DEFAULT_TIME_OUT = 5
 BUTTONREPEAT_FIRST = 0  # first manual trigger click
 BUTTONREPEAT_LOOP = 1  # automated loop
 BUTTONREPEAT_POST = -1  # final call after autoduration expired - no action needed in most cases
+# Seconds an active autorepeat control keeps holding its last command while a required input is invalid (e.g. Modbus read timeouts),
+# measured from the last time every required input was valid. Beyond this the control is stopped. 0 stops immediately.
+AUTOREPEAT_INVALID_INPUT_GRACE = 600.0
 
 # ================================= Definitions for Sensor Declarations =================================================
 
