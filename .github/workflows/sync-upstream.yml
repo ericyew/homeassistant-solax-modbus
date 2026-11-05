@@ -1,9 +1,10 @@
 name: Sync fork with upstream release
 
 # GitHub can't fire a webhook into this fork when the upstream repo
-# publishes a release, so this polls upstream on a schedule: fast-forwards
-# main, mirrors recent release tags, and mirrors Release entries (title +
-# notes). Tag pushes are scoped to recent releases only (not `--tags`),
+# publishes a release, so this polls upstream on a schedule: merges
+# upstream into main (main carries fork-only patches, so it can't be
+# fast-forwarded), mirrors recent release tags, and mirrors Release entries
+# (title + notes). Tag pushes are scoped to recent releases only (not `--tags`),
 # since brand-new tag refs are pushed as their whole tree from scratch and
 # some ancient upstream tags contain workflow files GITHUB_TOKEN can't
 # push without the `workflow` OAuth scope, which it doesn't have.
@@ -39,11 +40,11 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch upstream --tags
 
-      - name: Fast-forward main to upstream
+      - name: Merge upstream into main
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git merge --ff-only upstream/main
+          git merge --no-edit upstream/main
           git push origin main
 
       - name: Fetch recent upstream releases
