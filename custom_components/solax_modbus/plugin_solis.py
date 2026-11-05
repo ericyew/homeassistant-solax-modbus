@@ -19,7 +19,7 @@ from homeassistant.helpers.entity import (  # type: ignore[attr-defined]
     EntityCategory,
 )
 
-from custom_components.solax_modbus.const import (  # type: ignore[attr-defined]
+from custom_components.solax_modbus.const import (
     CONF_READ_DCB,
     CONF_READ_EPS,
     DEFAULT_READ_DCB,
@@ -105,7 +105,7 @@ async def async_read_serialnr(hub: Any, address: int, swapbytes: bool) -> str | 
     res = None
     try:
         inverter_data = await hub.async_read_input_registers(unit=hub._modbus_addr, address=address, count=8)
-        if not inverter_data.isError():
+        if inverter_data is not None and not inverter_data.isError():
             raw = convert_from_registers(inverter_data.registers[0:8], DataType.STRING, "big")  # type: ignore[attr-defined]  # Dynamic enum aliasing
             res = raw.decode("ascii", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
             if swapbytes:
@@ -114,10 +114,10 @@ async def async_read_serialnr(hub: Any, address: int, swapbytes: bool) -> str | 
                 res = str(ba, "ascii")  # convert back to string
             hub.seriesnumber = res
     except Exception:
-        _LOGGER.warning(f"{hub.name}: attempt to read serialnumber failed at 0x{address:x}", exc_info=True)
+        _LOGGER.warning("%s: attempt to read serialnumber failed at 0x%x", hub.name, address, exc_info=True)
     if not res:
-        _LOGGER.warning(f"{hub.name}: reading serial number from address 0x{address:x} failed; other address may succeed")
-    _LOGGER.info(f"Read {hub.name} 0x{address:x} serial number: {res}, swapped: {swapbytes}")
+        _LOGGER.warning("%s: reading serial number from address 0x%x failed; other address may succeed", hub.name, address)
+    _LOGGER.info("Read %s 0x%x serial number: %s, swapped: %s", hub.name, address, res, swapbytes)
     return res
 
 
@@ -163,7 +163,7 @@ def mutate_bit_in_register(bit: int | None, state: bool | None, descr: str | Non
     assert bit is not None and descr is not None
     state_int = 1 if state else 0
     value = int(datadict.get(descr, 0))
-    _LOGGER.debug(f">>> Old value of {descr}: {value}")
+    _LOGGER.debug(">>> Old value of %s: %s", descr, value)
     new_value = (value & ~(1 << bit)) | (state_int << bit)
     return new_value
 
@@ -1241,6 +1241,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         value_function=value_function_pv1_power,
+        depends_on=["pv_voltage_1", "pv_current_1"],
         allowedtypes=HYBRID,
         icon="mdi:solar-power-variant",
     ),
@@ -1276,6 +1277,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         value_function=value_function_pv2_power,
+        depends_on=["pv_voltage_2", "pv_current_2"],
         allowedtypes=HYBRID,
         icon="mdi:solar-power-variant",
     ),
@@ -1311,6 +1313,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         value_function=value_function_pv3_power,
+        depends_on=["pv_voltage_3", "pv_current_3"],
         allowedtypes=HYBRID | MPPT4 | MPPT3,
         icon="mdi:solar-power-variant",
     ),
@@ -1346,6 +1349,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         value_function=value_function_pv4_power,
+        depends_on=["pv_voltage_4", "pv_current_4"],
         allowedtypes=HYBRID | MPPT4,
         icon="mdi:solar-power-variant",
     ),
@@ -1826,6 +1830,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         key="total_battery_charge",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
         register=33161,
         register_type=REG_INPUT,
         register_data_type=REGISTER_U32,
@@ -1860,6 +1865,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         key="total_battery_discharge",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
         register=33165,
         register_type=REG_INPUT,
         register_data_type=REGISTER_U32,
@@ -2724,10 +2730,10 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
 @dataclass(kw_only=True)
 class solis_plugin(plugin_base):
     async def async_determineInverterType(self, hub: Any, configdict: dict[str, Any]) -> int:
-        _LOGGER.info(f"{hub.name}: trying to determine inverter type")
+        _LOGGER.info("%s: trying to determine inverter type", hub.name)
         seriesnumber = await async_read_serialnr(hub, 33004, swapbytes=False)
         if not seriesnumber:
-            _LOGGER.error(f"{hub.name}: cannot find serial number, even not for other Inverter")
+            _LOGGER.error("%s: cannot find serial number, even not for other Inverter", hub.name)
             seriesnumber = "unknown"
 
         # derive invertertype from seriiesnumber
@@ -2757,12 +2763,18 @@ class solis_plugin(plugin_base):
             invertertype = HYBRID | X1  # Hybrid Gen5 3.6kW - 48v
         elif seriesnumber.startswith("160F5"):
             invertertype = HYBRID | X1  # Hybrid Gen5 3.6kW - 48v
+        elif seriesnumber.startswith("103303"):
+            invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  5kW - HV
         elif seriesnumber.startswith("103305"):
             invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  8kW - HV
-        elif seriesnumber.startswith("103306"):
+        elif seriesnumber.startswith(("103306", "133306")):
             invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  10kW - HV
         elif seriesnumber.startswith("103314"):
             invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  12kW - HV
+        elif seriesnumber.startswith("103315"):
+            invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  15kW - HV (S6-EH3P15K-H) #2468
+        elif seriesnumber.startswith("103316"):
+            invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  20kW - HV (S6-EH3P20K-H)
         elif seriesnumber.startswith("103330"):
             invertertype = HYBRID | X3  # Hybrid Gen6 10kW - 48v
         elif seriesnumber.startswith("110C"):
@@ -2773,6 +2785,8 @@ class solis_plugin(plugin_base):
             invertertype = HYBRID | X3  # PV Only Gen5 5-20kW
         elif seriesnumber.startswith("2051"):
             invertertype = HYBRID | X1  # Hybrid Gen6 EO1p-48v 5kW
+        elif seriesnumber.startswith("303126"):
+            invertertype = HYBRID | X1  # S6-EH1P8K-L-PLUS, single phase, two MPPTs
         elif seriesnumber.startswith("6031"):
             invertertype = HYBRID | X1  # Hybrid Gen5 3105 / 3122 Model 6kW - 48V
         elif seriesnumber.startswith("6041"):
@@ -2785,7 +2799,7 @@ class solis_plugin(plugin_base):
 
         else:
             invertertype = 0
-            _LOGGER.error(f"unrecognized {hub.name} inverter type - serial number : {seriesnumber}")
+            _LOGGER.error("unrecognized %s inverter type - serial number : %s", hub.name, seriesnumber)
 
         if invertertype > 0:
             read_eps = configdict.get(CONF_READ_EPS, DEFAULT_READ_EPS)

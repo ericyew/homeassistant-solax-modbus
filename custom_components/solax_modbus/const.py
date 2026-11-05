@@ -1,8 +1,8 @@
 import logging
 import pathlib
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, Self
@@ -10,28 +10,11 @@ from typing import Any, Self
 from homeassistant.components.button import ButtonEntityDescription
 from homeassistant.components.number import NumberEntityDescription
 from homeassistant.components.select import SelectEntityDescription
-from homeassistant.components.sensor import SensorEntityDescription
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntityDescription
 from homeassistant.components.switch import SwitchEntityDescription
 from homeassistant.components.time import TimeEntityDescription
-from homeassistant.const import CONF_SCAN_INTERVAL
-
-# TODO: Review if this fallback is still needed.
-# UnitOfReactivePower was added in HA 2023.1 (Jan 2023). This fallback supports
-# HA versions older than 2023.1. Consider adding a minimum HA version to manifest.json
-# and removing this fallback if older versions are no longer supported.
-# See: https://developers.home-assistant.io/blog/2022/12/05/more-unit-enumerators
-try:
-    from homeassistant.const import (
-        UnitOfReactivePower,
-    )
-except ImportError:
-    from homeassistant.const import POWER_VOLT_AMPERE_REACTIVE
-
-    class UnitOfReactivePower(StrEnum):  # type: ignore[no-redef]
-        """Fallback for HA versions <2023.1."""
-
-        VOLT_AMPERE_REACTIVE = POWER_VOLT_AMPERE_REACTIVE
-
+from homeassistant.const import CONF_SCAN_INTERVAL, UnitOfPower
+from homeassistant.const import UnitOfReactivePower as UnitOfReactivePower  # Re-export for the inverter plugins.
 
 # ================================= Definitions for config_flow ==========================================================
 
@@ -50,7 +33,10 @@ CONF_INVERTER_NAME_SUFFIX = "inverter_name_suffix"
 CONF_INVERTER_POWER_KW = "inverter_power_kw"
 CONF_READ_EPS = "read_eps"
 CONF_READ_DCB = "read_dcb"
+CONF_READ_GEN = "read_gen"
 CONF_READ_PM = "read_pm"
+CONF_READ_EMS = "read_ems"
+CONF_READ_DATAHUB = "read_datahub"
 CONF_MODBUS_ADDR = "read_modbus_addr"
 CONF_INTERFACE = "interface"
 CONF_SERIAL_PORT = "read_serial_port"
@@ -59,6 +45,7 @@ CONF_BAUDRATE = "baudrate"
 CONF_PLUGIN = "plugin"
 CONF_READ_BATTERY = "read_battery"
 CONF_CORE_HUB = "read_core_hub"
+CONF_CORE_CONNECTION = "core_connection"
 CONF_ENERGY_DASHBOARD_DEVICE = "energy_dashboard_device"
 CONF_DEBUG_SETTINGS = "debug_settings"
 ATTR_MANUFACTURER = "SolaX Power"
@@ -66,13 +53,16 @@ DEFAULT_INTERFACE = "tcp"
 DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
 DEFAULT_READ_EPS = False
 DEFAULT_READ_DCB = False
+DEFAULT_READ_GEN = False
 DEFAULT_READ_PM = False
+DEFAULT_READ_EMS = False
+DEFAULT_READ_DATAHUB = False
 DEFAULT_BAUDRATE = "19200"
 DEFAULT_PLUGIN = "solax"
 DEFAULT_READ_BATTERY = False
 ENERGY_DASHBOARD_DEVICE_ENABLED = True
 ENERGY_DASHBOARD_DEVICE_DISABLED = False
-DEFAULT_ENERGY_DASHBOARD_DEVICE = ENERGY_DASHBOARD_DEVICE_ENABLED
+DEFAULT_ENERGY_DASHBOARD_DEVICE = ENERGY_DASHBOARD_DEVICE_DISABLED
 PLUGIN_PATH = f"{pathlib.Path(__file__).parent.absolute()}/plugin_*.py"
 SLEEPMODE_NONE = None
 SLEEPMODE_ZERO = 0  # when no communication at all
@@ -93,6 +83,9 @@ DEFAULT_TIME_OUT = 5
 BUTTONREPEAT_FIRST = 0  # first manual trigger click
 BUTTONREPEAT_LOOP = 1  # automated loop
 BUTTONREPEAT_POST = -1  # final call after autoduration expired - no action needed in most cases
+# Seconds an active autorepeat control keeps holding its last command while a required input is invalid (e.g. Modbus read timeouts),
+# measured from the last time every required input was valid. Beyond this the control is stopped. 0 stops immediately.
+AUTOREPEAT_INVALID_INPUT_GRACE = 600.0
 
 # ================================= Definitions for Sensor Declarations =================================================
 
@@ -171,6 +164,7 @@ class plugin_base:
     SELECT_TYPES: Sequence[SelectEntityDescription]
     SWITCH_TYPES: Sequence[SwitchEntityDescription]
     TIME_TYPES: Sequence[TimeEntityDescription]
+    EXTERNAL_SOURCE_TYPES: dict[str, UnitOfPower | None] = field(default_factory=dict)
     BATTERY_CONFIG: base_battery_config | None = None
     ENERGY_DASHBOARD_MAPPING: Any = None  # Optional energy dashboard configuration
     block_size: int = 100
@@ -238,6 +232,8 @@ class BaseModbusSensorEntityDescription(SensorEntityDescription):
     """Base class for modbus sensor declarations."""
 
     allowedtypes: int = 0  # overload with ALLDEFAULT from plugin
+    device_group: str | None = None  # assign the entity to a named sub-device instead of the main inverter device
+    active_when: dict[str, tuple[Any, ...]] | None = None  # {sensor_key: allowed values}; entity is unavailable unless every polled key matches
     order32: str | None = None  # per-sensor 32-bit word order override ("big"/"little"); None = plugin default
     modbus_min: int | None = None  # Minimum protocol version as reported by register 0x82 (e.g. 100 for V001.00); not the document revision.
     modbus_max: int | None = None  # Maximum protocol version as reported by register 0x82.
@@ -251,6 +247,7 @@ class BaseModbusSensorEntityDescription(SensorEntityDescription):
     rounding: int = 1
     register_type: int | None = None  # REG_HOLDING or REG_INPUT or REG_DATA
     register_data_type: str | None = None  # REGISTER_U16, REGISTER_S32, REGISTER_F32, etc.
+    fault_bits: dict[int, str] | None = None  # Bit index -> fault label; keep the polled integer as the raw value.
     scan_group: str | None = None  # SCAN_GROUP_MEDIUM, SCAN_GROUP_FAST, SCAN_GROUP_DEFAULT, etc.
     internal: bool = False  # internal sensors are used for reading data only; used for computed, selects, etc
     newblock: bool = False  # set to True to start a new modbus read block operation - do not use frequently
@@ -271,17 +268,58 @@ class BaseModbusSensorEntityDescription(SensorEntityDescription):
     # The name and key must contain a placeholder {} that is replaced by the preceding number
     min_value: int | None = None
     max_value: int | None = None
-    # Possible register keys required by the value function. On partial polls,
-    # computed sensors are only recalculated when every active dependency is fresh.
+    # Input contract for register-less computed sensors. ``depends_on`` contains
+    # mandatory inputs, ``depends_on_any`` contains alternative groups where at
+    # least one input must be available, and ``optional_depends_on`` contains
+    # inputs used only when valid and fresh, otherwise omitted. An explicit empty
+    # ``depends_on`` declares a calculation with no readiness inputs or expiry,
+    # provided no other input contract or special source mapping exists. ``None``
+    # means that the contract was not declared and the calculation is rejected.
     depends_on: list[str] | None = None
+    depends_on_any: list[tuple[str, ...]] | None = None
+    optional_depends_on: list[str] | None = None
+    external_override: str | None = None  # Optional external sensor name (e.g. "external_house_load") which can override value
+    # the computed or modbus register value
+    readiness_validator: Callable[[dict[str, Any]], bool] | None = None
+    dependency_selector: Callable[[dict[str, Any], set[str]], tuple[set[str], set[str]]] | None = None
+    recompute_each_poll: bool = False
+    allow_none: bool = False  # Explicit unknown output, never a numeric zero.
     _energy_dashboard_device_info: Any = None  # DeviceInfo for energy dashboard
     _energy_dashboard_mapping: Any = None  # EnergyDashboardMapping
     _energy_dashboard_source_hub: Any = None  # Source hub reference
+    _energy_dashboard_source_hubs: tuple[Any, ...] | None = None  # All contributors to an aggregate
     _is_riemann_sum_sensor: bool = False  # Whether this is a Riemann sum sensor
     _riemann_mapping: Any = None  # Riemann mapping configuration
     _riemann_data_hub: Any = None  # Riemann data hub reference
     _is_daily_delta_sensor: bool = False  # Whether this is a daily delta sensor calculated from a cumulative total
     _daily_delta_source_key: str | None = None  # Source cumulative total key for daily delta sensors
+
+
+def descriptor_optional_depends(description: Any) -> list[str] | None:
+    descr_deps: list[str] | None = getattr(description, "optional_depends_on", None)
+    external_dep: str | None = getattr(description, "external_override", None)
+    if external_dep is None:
+        return descr_deps
+    if descr_deps is None:
+        return [external_dep]
+    return [*descr_deps, external_dep]
+
+
+def is_inputless_computed_sensor(description: Any) -> bool:
+    """Only an explicit empty input contract exempts a computation from expiry."""
+    return (
+        getattr(description, "register", -1) < 0
+        and bool(getattr(description, "value_function", None))
+        and getattr(description, "depends_on", None) == []
+        and not getattr(description, "optional_depends_on", None)
+        and not getattr(description, "external_override", None)
+        and not getattr(description, "depends_on_any", None)
+        and getattr(description, "dependency_selector", None) is None
+        and getattr(description, "readiness_validator", None) is None
+        and getattr(description, "_energy_dashboard_mapping", None) is None
+        and not getattr(description, "_is_riemann_sum_sensor", False)
+        and not getattr(description, "_is_daily_delta_sensor", False)
+    )
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -297,6 +335,11 @@ class BaseModbusButtonEntityDescription(ButtonEntityDescription):
     write_method: int = WRITE_SINGLE_MODBUS  # WRITE_SINGLE_MOBUS or WRITE_MULTI_MODBUS or WRITE_DATA_LOCAL
     value_function: Callable[[Any, Any, dict[str, Any]], Any] | None = None  #  value = function(initval, descr, datadict)
     autorepeat: str | None = None  # if not None: name of entity that contains autorepeat duration in seconds
+    autorepeat_dependencies: tuple[str, ...] | None = None  # Required model inputs, regardless of control sub-mode
+    autorepeat_optional_dependencies: tuple[str, ...] = ()  # Only valid accepted inputs reach the controller
+    autorepeat_control: str | None = None  # Local mode request; explicit Disabled bypasses the input gate
+    autorepeat_parallel_dependencies: dict[str, tuple[str, ...]] | None = None  # Fixed inputs for each supported topology
+    autorepeat_cadence: tuple[str, ...] = ()
     depends_on: list[str] | None = None  # list of modbus register keys that must be read
 
 
@@ -305,6 +348,8 @@ class BaseModbusSelectEntityDescription(SelectEntityDescription):
     """Base class for modbus select declarations."""
 
     allowedtypes: int = 0  # overload with ALLDEFAULT from plugin
+    device_group: str | None = None  # assign the entity to a named sub-device instead of the main inverter device
+    active_when: dict[str, tuple[Any, ...]] | None = None  # {sensor_key: allowed values}; entity is unavailable unless every polled key matches
     modbus_min: int | None = None  # Minimum protocol version as reported by register 0x82 (e.g. 100 for V001.00); not the document revision.
     modbus_max: int | None = None  # Maximum protocol version as reported by register 0x82.
     register: int | None = None
@@ -318,6 +363,12 @@ class BaseModbusSelectEntityDescription(SelectEntityDescription):
     depends_on: list[str] | None = None  # list of modbus register keys that must be read
     value_function: Callable[[Any, Any, dict[str, Any]], Any] | None = None  # value function for autorepeat (same pattern as buttons)
     autorepeat: bool = False  # if True: select will use value_function for autorepeat
+    # For external source selects: options are fetched from HA entity registry at runtime
+    dynamic_options: bool = False  # When dynamic_options=True, option_dict should be None
+    # Which device_class to filter for (e.g. POWER); None = no filter (all sensors)
+    dynamic_device_class: SensorDeviceClass | None = None
+    # Optional transactional writer: (hub, unit, description, raw value). Must raise on failure.
+    async_write_function: Callable[[Any, int, Any, int | float], Awaitable[None]] | None = None
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -325,6 +376,8 @@ class BaseModbusSwitchEntityDescription(SwitchEntityDescription):
     """Base class for modbus switch declarations."""
 
     allowedtypes: int = 0  # overload with ALLDEFAULT from plugin
+    device_group: str | None = None  # assign the entity to a named sub-device instead of the main inverter device
+    active_when: dict[str, tuple[Any, ...]] | None = None  # {sensor_key: allowed values}; entity is unavailable unless every polled key matches
     modbus_min: int | None = None  # Minimum protocol version as reported by register 0x82 (e.g. 100 for V001.00); not the document revision.
     modbus_max: int | None = None  # Maximum protocol version as reported by register 0x82.
     register: int | None = None
@@ -344,6 +397,8 @@ class BaseModbusTimeEntityDescription(TimeEntityDescription):
     """Base class for modbus time declarations."""
 
     allowedtypes: int = 0  # overload with ALLDEFAULT from plugin
+    device_group: str | None = None  # assign the entity to a named sub-device instead of the main inverter device
+    active_when: dict[str, tuple[Any, ...]] | None = None  # {sensor_key: allowed values}; entity is unavailable unless every polled key matches
     modbus_min: int | None = None  # Minimum protocol version as reported by register 0x82 (e.g. 100 for V001.00); not the document revision.
     modbus_max: int | None = None  # Maximum protocol version as reported by register 0x82.
     scale: float | dict[Any, Any] | Callable[[Any, Any, dict[str, Any]], Any] = 1
@@ -373,6 +428,8 @@ class BaseModbusNumberEntityDescription(NumberEntityDescription):
     """Base class for modbus number declarations."""
 
     allowedtypes: int = 0  # overload with ALLDEFAULT from plugin
+    device_group: str | None = None  # assign the entity to a named sub-device instead of the main inverter device
+    active_when: dict[str, tuple[Any, ...]] | None = None  # {sensor_key: allowed values}; entity is unavailable unless every polled key matches
     modbus_min: int | None = None  # Minimum protocol version as reported by register 0x82 (e.g. 100 for V001.00); not the document revision.
     modbus_max: int | None = None  # Maximum protocol version as reported by register 0x82.
     register: int | None = None
@@ -391,9 +448,12 @@ class BaseModbusNumberEntityDescription(NumberEntityDescription):
     prevent_update: bool = False  # if set to True, value will not be re-read/updated with each polling cycle;
     # update only when read value changes
     sensor_key: str | None = None  # only specify this if corresponding sensor has a different key name
+    max_key: str | None = None  # key of a sensor whose value dynamically overrides native_max_value
     depends_on: list[str] | None = None  # list of modbus register keys that must be read
     display_as_box: bool = True  # display numbers as an input box (default); set False for a slider.
     suggested_display_precision: int | None = None
+    # Optional transactional writer: (hub, unit, description, raw value). Must raise on failure.
+    async_write_function: Callable[[Any, int, Any, int | float], Awaitable[None]] | None = None
 
 
 def modbus_protocol_version(hub: Any) -> int:
@@ -405,6 +465,22 @@ def modbus_protocol_version(hub: Any) -> int:
         return int(version or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def matches_active_when(hub: Any, description: Any) -> bool:
+    """Return whether an entity's active_when conditions are currently met.
+
+    Conditions reference polled hub.data keys; a key that is absent from
+    hub.data (not polled on this model) does not block availability.
+    """
+    conditions = getattr(description, "active_when", None)
+    if not conditions:
+        return True
+    data = getattr(hub, "data", {})
+    for key, allowed in conditions.items():
+        if key in data and data[key] not in allowed:
+            return False
+    return True
 
 
 def matches_modbus_protocol(hub: Any, description: Any) -> bool:
@@ -494,19 +570,23 @@ def value_function_battery_input(initval: Any, descr: Any, datadict: dict[str, A
     return 0
 
 
-def value_function_battery_output_solis(initval: Any, descr: Any, datadict: dict[str, Any]) -> int | float:
+def value_function_battery_output_solis(initval: Any, descr: Any, datadict: dict[str, Any]) -> int | float | None:
     """Calculate battery output power for Solis inverters."""
-    inout: int = datadict.get("battery_charge_direction", 0)
-    val: int | float = datadict.get("battery_power", 0)
+    inout = datadict.get("battery_charge_direction")
+    val: int | float | None = datadict.get("battery_power")
+    if inout not in (0, 1) or val is None:
+        return None
     if inout == 1:
         return abs(val)
     return 0
 
 
-def value_function_battery_input_solis(initval: Any, descr: Any, datadict: dict[str, Any]) -> int | float:
+def value_function_battery_input_solis(initval: Any, descr: Any, datadict: dict[str, Any]) -> int | float | None:
     """Calculate battery input power for Solis inverters."""
-    inout: int = datadict.get("battery_charge_direction", 0)
-    val: int | float = datadict.get("battery_power", 0)
+    inout = datadict.get("battery_charge_direction")
+    val: int | float | None = datadict.get("battery_power")
+    if inout not in (0, 1) or val is None:
+        return None
     if inout == 0:
         return val
     return 0

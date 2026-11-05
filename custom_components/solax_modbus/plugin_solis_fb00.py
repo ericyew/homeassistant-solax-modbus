@@ -19,7 +19,7 @@ from homeassistant.helpers.entity import (  # type: ignore[attr-defined]
     EntityCategory,
 )
 
-from custom_components.solax_modbus.const import (  # type: ignore[attr-defined]
+from custom_components.solax_modbus.const import (
     CONF_READ_DCB,
     CONF_READ_EPS,
     DEFAULT_READ_DCB,
@@ -118,10 +118,10 @@ async def async_read_serialnr(hub: Any, address: int, swapbytes: bool) -> str | 
                 res = str(ba, "ascii")  # convert back to string
             hub.seriesnumber = res
     except Exception:
-        _LOGGER.warning(f"{hub.name}: attempt to read serialnumber failed at 0x{address:x}", exc_info=True)
+        _LOGGER.warning("%s: attempt to read serialnumber failed at 0x%x", hub.name, address, exc_info=True)
     if not res:
-        _LOGGER.warning(f"{hub.name}: reading serial number from address 0x{address:x} failed; other address may succeed")
-    _LOGGER.info(f"Read {hub.name} 0x{address:x} serial number: {res}, swapped: {swapbytes}")
+        _LOGGER.warning("%s: reading serial number from address 0x%x failed; other address may succeed", hub.name, address)
+    _LOGGER.info("Read %s 0x%x serial number: %s, swapped: %s", hub.name, address, res, swapbytes)
     return res
 
 
@@ -175,15 +175,76 @@ def value_function_battery_control_override(initval: int, descr: Any, datadict: 
     return None
 
 
+# ====================================== Remote Dispatch (protocol Ver3.4, 44100-44199) =========================
+# Real-time dispatch block present on dispatch-capable firmware (input 34502 reads
+# 0xAA55). RAM-only with an inverter-side failsafe (register 44101): if no fresh
+# dispatch write arrives within the failsafe window the inverter reverts to its
+# normal storage-mode logic on its own. The realtime block must be written as
+# contiguous FC16 writes (scattered single-register writes are re-initialised),
+# and the global block must be written first so the function field sticks.
+# Live-verified on S5-EH1P6K-L fw 4F0052 (issue #2179): dispatch mode 2
+# (battery discharge, signed S32 power) runs freely below the timed-slot
+# discharge-SOC floor that this firmware otherwise enforces, making this the
+# only full-depth export path on affected firmware. Credit: write order and
+# mode mapping documented by Pho3niX90/solis_modbus (DISPATCH_* constants).
+
+
+def value_function_dispatch_apply(initval: Any, descr: Any, datadict: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Block-write the realtime dispatch block (44105-44112) from the local dispatch entities."""
+    mode = DISPATCH_MODE_OPTIONS_INV.get(datadict.get("dispatch_mode", "Battery Hold"), 1)
+    return [
+        ("_uint16", mode),
+        ("dispatch_power", int(datadict.get("dispatch_power", 0))),
+        ("_uint16", 0),
+        ("dispatch_soc_min", int(datadict.get("dispatch_soc_min", 0))),
+        ("dispatch_soc_max", int(datadict.get("dispatch_soc_max", 100))),
+        ("_uint16", 0),
+        ("_uint16", 0),
+    ]
+
+
+def value_function_dispatch_master_off(initval: Any, descr: Any, datadict: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Live-verified single-block stop: master off + failsafe back to default leaves the
+    dispatch block at the clean state (status 34504 -> 0) without touching the realtime block."""
+    return [
+        ("_uint16", 0),
+        ("_uint16", 5),
+        ("_uint16", 0),
+        ("_uint16", 0xFFFF),
+        ("_uint16", 0xFFFF),
+    ]
+
+
+DISPATCH_MODE_OPTIONS = {
+    1: "Battery Hold",
+    2: "Battery Charge",
+    3: "Grid Import",
+    4: "Grid Port Import",
+    5: "Self Consumption",
+    6: "Feed-in Priority",
+}
+# Modes 2/3/4 encode battery charge/discharge and grid import/export as register
+# values 2/3/4; direction comes from the sign of the S32 power value (negative =
+# battery discharge / grid export). The select exposes merged names.
+DISPATCH_MODE_OPTIONS_INV = {v: k for k, v in DISPATCH_MODE_OPTIONS.items()}
+
+
 # ============================================= Charging ===========================================================
+
+
 # This value function converts the bits to the number
 def value_function_timing_on_off(bit: int | None, state: bool | None, descr: str | None, datadict: dict[str, Any]) -> int:
     assert bit is not None and descr is not None
     state_int = 1 if state else 0
     value = int(datadict.get(descr, 0))
-    _LOGGER.debug(f">>> Old value of {descr}: {value}")
+    _LOGGER.debug(">>> Old value of %s: %s", descr, value)
     new_value = (value & ~(1 << bit)) | (state_int << bit)
     return new_value
+
+
+def value_function_direct_on_off(bit: int | None, state: bool | None, descr: str | None, datadict: dict[str, Any]) -> int:
+    """Write the switch state directly as the whole register value (e.g. dispatch master 44100)."""
+    return 1 if state else 0
 
 
 def value_function_timingmode_charge_1(initval: Any, descr: Any, datadict: dict[str, Any]) -> list[tuple[str, Any]]:
@@ -457,6 +518,29 @@ def value_function_pv4_power(initval: int, descr: Any, datadict: dict[str, Any])
     return float(datadict.get("pv_voltage_4", 0)) * float(datadict.get("pv_current_4", 0))
 
 
+def value_function_smart_port_mode(initval: int, descr: Any, datadict: dict[str, Any]) -> str | None:
+    """Derive the Smart Port function from holding registers 43365 and 43483.
+
+    43365 BIT01 = With Generator; BIT00/BIT04 = generator location (0/0 = Smart port).
+    43365 BIT03 = AC Coupled location (0 = generator/Smart port, 1 = Backup port).
+    43483 BIT00 = Smart Load enable; BIT01 = AC Coupled enable.
+    """
+    gen = datadict.get("generator_setting_switch")
+    func = datadict.get("energy_storage_function_control_word")
+    if gen is None and func is None:
+        return None
+    gen = int(gen or 0)
+    func = int(func or 0)
+    modes = []
+    if gen & 0x02 and not gen & 0x01 and not gen & 0x10:
+        modes.append("Generator")
+    if func & 0x02 and not gen & 0x08:
+        modes.append("AC Coupled")
+    if func & 0x01:
+        modes.append("Smart Load")
+    return " + ".join(modes) if modes else "Disabled"
+
+
 # ================================= Button Declarations ============================================================
 
 BUTTON_TYPES = [
@@ -468,6 +552,24 @@ BUTTON_TYPES = [
         write_method=WRITE_MULTI_MODBUS,
         icon="mdi:home-clock",
         value_function=value_function_sync_rtc_ymd,
+    ),
+    SolisModbusButtonEntityDescription(
+        name="Apply Remote Dispatch",
+        key="dispatch_apply",
+        register=44105,
+        allowedtypes=HYBRID,
+        write_method=WRITE_MULTI_MODBUS,
+        icon="mdi:transmit",
+        value_function=value_function_dispatch_apply,
+    ),
+    SolisModbusButtonEntityDescription(
+        name="Disable Remote Dispatch",
+        key="dispatch_disable",
+        register=44100,
+        allowedtypes=HYBRID,
+        write_method=WRITE_MULTI_MODBUS,
+        icon="mdi:close-circle-outline",
+        value_function=value_function_dispatch_master_off,
     ),
     SolisModbusButtonEntityDescription(
         name="Update Charge Times",
@@ -1520,6 +1622,73 @@ NUMBER_TYPES = [
         allowedtypes=HYBRID,
         entity_category=EntityCategory.CONFIG,
     ),
+    # ============================ Remote Dispatch (Ver3.4 44100 block) ============================
+    # Locally-staged numbers (WRITE_DATA_LOCAL) + Apply button (block write), mirroring the
+    # timed charge/discharge "Update Times" pattern: the realtime block must land as one
+    # contiguous FC16 write, with the global block already on (master switch below).
+    SolisModbusNumberEntityDescription(
+        name="Dispatch Power",
+        key="dispatch_power",
+        register=-1,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=NumberDeviceClass.POWER,
+        fmt="i",
+        register_data_type=REGISTER_S32,
+        scale=0.1,
+        native_min_value=-24000,
+        native_max_value=24000,
+        native_step=100,
+        allowedtypes=HYBRID,
+        write_method=WRITE_DATA_LOCAL,
+        entity_category=EntityCategory.CONFIG,
+        icon="mdi:transmit",
+    ),
+    SolisModbusNumberEntityDescription(
+        name="Dispatch Failsafe Interval",
+        key="dispatch_failsafe",
+        register=44101,
+        native_unit_of_measurement=UnitOfTime.MINUTES,
+        fmt="i",
+        native_min_value=1,
+        native_max_value=1440,
+        native_step=1,
+        allowedtypes=HYBRID,
+        write_method=WRITE_SINGLE_MODBUS,
+        entity_category=EntityCategory.CONFIG,
+        icon="mdi:timer-outline",
+    ),
+    SolisModbusNumberEntityDescription(
+        name="Dispatch SOC Minimum",
+        key="dispatch_soc_min",
+        register=-1,
+        native_unit_of_measurement=PERCENTAGE,
+        device_class=NumberDeviceClass.BATTERY,
+        fmt="i",
+        register_data_type=REGISTER_U16,
+        native_min_value=0,
+        native_max_value=100,
+        native_step=1,
+        allowedtypes=HYBRID,
+        write_method=WRITE_DATA_LOCAL,
+        entity_category=EntityCategory.CONFIG,
+        icon="mdi:battery-low",
+    ),
+    SolisModbusNumberEntityDescription(
+        name="Dispatch SOC Maximum",
+        key="dispatch_soc_max",
+        register=-1,
+        native_unit_of_measurement=PERCENTAGE,
+        device_class=NumberDeviceClass.BATTERY,
+        fmt="i",
+        register_data_type=REGISTER_U16,
+        native_min_value=0,
+        native_max_value=100,
+        native_step=1,
+        allowedtypes=HYBRID,
+        write_method=WRITE_DATA_LOCAL,
+        entity_category=EntityCategory.CONFIG,
+        icon="mdi:battery-full",
+    ),
     # ============================ TimeSlot 1 ==============================
     SolisModbusNumberEntityDescription(
         name="Timed Charge SOC",
@@ -2058,6 +2227,16 @@ NUMBER_TYPES = [
 
 # ================================= Select Declarations ============================================================
 SWITCH_TYPES = [
+    # ============================ Remote Dispatch (Ver3.4 44100 block) ============================
+    SolisModbusSwitchEntityDescription(
+        name="Dispatch Master",
+        key="dispatch_master",
+        register=44100,
+        allowedtypes=HYBRID,
+        value_function=value_function_direct_on_off,
+        entity_category=EntityCategory.CONFIG,
+        icon="mdi:power",
+    ),
     SolisModbusSwitchEntityDescription(
         name="Timed Charge Slot 1 Enable",
         key="timed_charge_slot_1_enable",
@@ -2169,6 +2348,17 @@ SWITCH_TYPES = [
 ]
 
 SELECT_TYPES = [
+    # ============================ Remote Dispatch (Ver3.4 44100 block) ============================
+    SolisModbusSelectEntityDescription(
+        name="Dispatch Control Mode",
+        key="dispatch_mode",
+        register=-1,
+        option_dict=DISPATCH_MODE_OPTIONS,
+        allowedtypes=HYBRID,
+        write_method=WRITE_DATA_LOCAL,
+        entity_category=EntityCategory.CONFIG,
+        icon="mdi:dip-switch",
+    ),
     SolisModbusSelectEntityDescription(
         name="Backflow Power Switch",
         key="backflow_power_switch",
@@ -2393,6 +2583,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         value_function=value_function_pv1_power,
+        depends_on=["pv_voltage_1", "pv_current_1"],
         allowedtypes=HYBRID,
         icon="mdi:solar-power-variant",
     ),
@@ -2428,6 +2619,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         value_function=value_function_pv2_power,
+        depends_on=["pv_voltage_2", "pv_current_2"],
         allowedtypes=HYBRID,
         icon="mdi:solar-power-variant",
     ),
@@ -2463,6 +2655,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         value_function=value_function_pv3_power,
+        depends_on=["pv_voltage_3", "pv_current_3"],
         allowedtypes=HYBRID | MPPT4 | MPPT3,
         icon="mdi:solar-power-variant",
     ),
@@ -2498,6 +2691,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         value_function=value_function_pv4_power,
+        depends_on=["pv_voltage_4", "pv_current_4"],
         allowedtypes=HYBRID | MPPT4,
         icon="mdi:solar-power-variant",
     ),
@@ -2835,6 +3029,54 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         allowedtypes=HYBRID,
     ),
     SolisModbusSensorEntityDescription(
+        name="Backup Voltage",
+        key="backup_voltage",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33137,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        allowedtypes=HYBRID | X1,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Backup Current",
+        key="backup_current",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33138,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        allowedtypes=HYBRID | X1,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Backup Voltage L1",
+        key="backup_voltage_l1",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33137,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Backup Current L1",
+        key="backup_current_l1",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33138,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
         name="Battery SOC",
         key="battery_soc",
         native_unit_of_measurement=PERCENTAGE,
@@ -2924,6 +3166,7 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         state_class=SensorStateClass.MEASUREMENT,
         register=33148,
         register_type=REG_INPUT,
+        register_data_type=REGISTER_S16,  # protocol: S16, negative = power flowing into Backup port
         allowedtypes=HYBRID,
         icon="mdi:home",
     ),
@@ -2939,6 +3182,54 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         entity_registry_enabled_default=False,
         allowedtypes=HYBRID,
         icon="mdi:home",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Backup Voltage L2",
+        key="backup_voltage_l2",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33153,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Backup Current L2",
+        key="backup_current_l2",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33154,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Backup Voltage L3",
+        key="backup_voltage_l3",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33155,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Backup Current L3",
+        key="backup_current_l3",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33156,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        allowedtypes=HYBRID | X3,
     ),
     SolisModbusSensorEntityDescription(
         name="Battery Input Energy",
@@ -3475,6 +3766,378 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         sleepmode=SLEEPMODE_LASTAWAKE,
         allowedtypes=HYBRID,
         icon="mdi:home-export-outline",
+    ),
+    # ============================ Generator / Smart Port (S6) ============================
+    SolisModbusSensorEntityDescription(
+        name="Generator Power",
+        key="generator_power",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33530,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_S16,
+        scale=10,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X1,
+        icon="mdi:engine",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Generator Power L1",
+        key="generator_power_l1",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33530,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_S16,
+        scale=10,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+        icon="mdi:engine",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Generator Power L2",
+        key="generator_power_l2",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33534,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_S16,
+        scale=10,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+        icon="mdi:engine",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Generator Power L3",
+        key="generator_power_l3",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=33535,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_S16,
+        scale=10,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+        icon="mdi:engine",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Generator Energy Today",
+        key="generator_energy_today",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        register=33531,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        sleepmode=SLEEPMODE_LASTAWAKE,
+        allowedtypes=HYBRID,
+        icon="mdi:engine",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Generator Energy Total",
+        key="generator_energy_total",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        register=33532,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_U32,
+        ignore_readerror=True,
+        sleepmode=SLEEPMODE_LASTAWAKE,
+        allowedtypes=HYBRID,
+        icon="mdi:engine",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Backup Load Energy Total",
+        key="backup_load_energy_total",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        register=33590,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_U32,
+        ignore_readerror=True,
+        sleepmode=SLEEPMODE_LASTAWAKE,
+        allowedtypes=HYBRID,
+        icon="mdi:home-lightning-bolt",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Backup Load Energy Today",
+        key="backup_load_energy_today",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        register=33596,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        sleepmode=SLEEPMODE_LASTAWAKE,
+        allowedtypes=HYBRID,
+        icon="mdi:home-lightning-bolt",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Voltage",
+        key="smart_port_voltage",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34328,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X1,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Voltage L1",
+        key="smart_port_voltage_l1",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34328,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Voltage L2",
+        key="smart_port_voltage_l2",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34329,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Voltage L3",
+        key="smart_port_voltage_l3",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34330,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Current",
+        key="smart_port_current",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34331,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X1,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Current L1",
+        key="smart_port_current_l1",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34331,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Current L2",
+        key="smart_port_current_l2",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34332,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Current L3",
+        key="smart_port_current_l3",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34333,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+    ),
+    # Positive = power flowing out of the Smart Port (smart load), negative = flowing in (AC-coupled PV)
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Power",
+        key="smart_port_power",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34391,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_S16,
+        scale=10,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X1,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Power L1",
+        key="smart_port_power_l1",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34391,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_S16,
+        scale=10,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Power L2",
+        key="smart_port_power_l2",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34392,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_S16,
+        scale=10,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Power L3",
+        key="smart_port_power_l3",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34393,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_S16,
+        scale=10,
+        ignore_readerror=True,
+        allowedtypes=HYBRID | X3,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Generator Frequency",
+        key="generator_frequency",
+        native_unit_of_measurement=UnitOfFrequency.HERTZ,
+        device_class=SensorDeviceClass.FREQUENCY,
+        state_class=SensorStateClass.MEASUREMENT,
+        register=34410,
+        register_type=REG_INPUT,
+        scale=0.01,
+        rounding=2,
+        ignore_readerror=True,
+        allowedtypes=HYBRID,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Generator Status",
+        key="generator_status",
+        register=34590,
+        register_type=REG_INPUT,
+        scale={
+            1: "Stopped",
+            2: "Supplying Power",
+            3: "Preheating",
+            4: "Cooling",
+        },
+        ignore_readerror=True,
+        allowedtypes=HYBRID,
+        icon="mdi:engine",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Load Energy Total",
+        key="smart_load_energy_total",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        register=34411,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_U32,
+        ignore_readerror=True,
+        sleepmode=SLEEPMODE_LASTAWAKE,
+        allowedtypes=HYBRID,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="AC Coupled Energy Total",
+        key="ac_coupled_energy_total",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        register=34445,
+        register_type=REG_INPUT,
+        register_data_type=REGISTER_U32,
+        ignore_readerror=True,
+        sleepmode=SLEEPMODE_LASTAWAKE,
+        allowedtypes=HYBRID,
+        icon="mdi:solar-power",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="AC Coupled Energy Today",
+        key="ac_coupled_energy_today",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        register=34451,
+        register_type=REG_INPUT,
+        scale=0.1,
+        rounding=1,
+        ignore_readerror=True,
+        sleepmode=SLEEPMODE_LASTAWAKE,
+        allowedtypes=HYBRID,
+        icon="mdi:solar-power",
+    ),
+    # Raw holding registers used to derive Smart Port Mode (read-only)
+    SolisModbusSensorEntityDescription(
+        name="Generator Setting Switch",
+        key="generator_setting_switch",
+        register=43365,
+        ignore_readerror=True,
+        entity_registry_enabled_default=False,  # needed in value function
+        allowedtypes=HYBRID,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Energy Storage Function Control Word",
+        key="energy_storage_function_control_word",
+        register=43483,
+        ignore_readerror=True,
+        entity_registry_enabled_default=False,  # needed in value function
+        allowedtypes=HYBRID,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Smart Port Mode",
+        key="smart_port_mode",
+        value_function=value_function_smart_port_mode,
+        depends_on=[
+            "generator_setting_switch",
+            "energy_storage_function_control_word",
+        ],
+        allowedtypes=HYBRID,
+        icon="mdi:power-socket-eu",
     ),
     SolisModbusSensorEntityDescription(
         name="Power Switch",
@@ -4453,6 +5116,77 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
         allowedtypes=HYBRID,
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
+    # ============================ Remote Dispatch (Ver3.4 44100 block) ============================
+    SolisModbusSensorEntityDescription(
+        name="Remote Dispatch Capability",
+        key="remote_dispatch_capability",
+        register=34502,
+        ignore_readerror=True,
+        register_type=REG_INPUT,
+        entity_registry_enabled_default=False,
+        allowedtypes=HYBRID,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:check-network",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Remote Dispatch Running Status",
+        key="remote_dispatch_status",
+        register=34504,
+        ignore_readerror=True,
+        register_type=REG_INPUT,
+        entity_registry_enabled_default=False,
+        allowedtypes=HYBRID,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:play-circle-outline",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Dispatch Master",
+        key="dispatch_master_sensor",
+        register=44100,
+        entity_registry_enabled_default=False,
+        allowedtypes=HYBRID,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:power",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Dispatch Control Mode",
+        key="dispatch_mode_sensor",
+        register=44105,
+        entity_registry_enabled_default=False,
+        allowedtypes=HYBRID,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:dip-switch",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Dispatch Power",
+        key="dispatch_power_sensor",
+        register=44106,
+        register_data_type=REGISTER_S32,
+        ignore_readerror=True,
+        scale=10,
+        entity_registry_enabled_default=False,
+        allowedtypes=HYBRID,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:transmit",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Dispatch SOC Window Min",
+        key="dispatch_soc_min_sensor",
+        register=44109,
+        entity_registry_enabled_default=False,
+        allowedtypes=HYBRID,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:battery-low",
+    ),
+    SolisModbusSensorEntityDescription(
+        name="Dispatch SOC Window Max",
+        key="dispatch_soc_max_sensor",
+        register=44110,
+        entity_registry_enabled_default=False,
+        allowedtypes=HYBRID,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:battery-full",
+    ),
 ]
 
 
@@ -4460,10 +5194,10 @@ SENSOR_TYPES: list[SolisModbusSensorEntityDescription] = [
 @dataclass(kw_only=True)
 class solis_fb00_plugin(plugin_base):
     async def async_determineInverterType(self, hub: Any, configdict: dict[str, Any]) -> int:
-        _LOGGER.info(f"{hub.name}: trying to determine inverter type")
+        _LOGGER.info("%s: trying to determine inverter type", hub.name)
         seriesnumber = await async_read_serialnr(hub, 33004, swapbytes=False)
         if not seriesnumber:
-            _LOGGER.error(f"{hub.name}: cannot find serial number, even not for other Inverter")
+            _LOGGER.error("%s: cannot find serial number, even not for other Inverter", hub.name)
             seriesnumber = "unknown"
 
         # derive invertertype from seriiesnumber
@@ -4493,12 +5227,18 @@ class solis_fb00_plugin(plugin_base):
             invertertype = HYBRID | X1  # Hybrid Gen5 3.6kW - 48v
         elif seriesnumber.startswith("160F5"):
             invertertype = HYBRID | X1  # Hybrid Gen5 3.6kW - 48v
+        elif seriesnumber.startswith("103303"):
+            invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  5kW - HV
         elif seriesnumber.startswith("103305"):
             invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  8kW - HV
-        elif seriesnumber.startswith("103306"):
+        elif seriesnumber.startswith(("103306", "133306")):
             invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  10kW - HV
         elif seriesnumber.startswith("103314"):
             invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  12kW - HV
+        elif seriesnumber.startswith("103315"):
+            invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  15kW - HV (S6-EH3P15K-H) #2468
+        elif seriesnumber.startswith("103316"):
+            invertertype = HYBRID | X3 | MPPT4  # Hybrid Gen6  20kW - HV (S6-EH3P20K-H)
         elif seriesnumber.startswith("103330"):
             invertertype = HYBRID | X3  # Hybrid Gen6  10kW - 48v
         elif seriesnumber.startswith("110C"):
@@ -4509,6 +5249,8 @@ class solis_fb00_plugin(plugin_base):
             invertertype = HYBRID | X3  # PV Only Gen5 5-20kW
         elif seriesnumber.startswith("2051"):
             invertertype = HYBRID | X1  # Hybrid Gen6 EO1p-48v 5kW
+        elif seriesnumber.startswith("303126"):
+            invertertype = HYBRID | X1  # S6-EH1P8K-L-PLUS, single phase, two MPPTs
         elif seriesnumber.startswith("6031"):
             invertertype = HYBRID | X1  # Hybrid Gen5 3105 / 3122 Model 6kW - 48V
         elif seriesnumber.startswith("6041"):
@@ -4521,7 +5263,7 @@ class solis_fb00_plugin(plugin_base):
 
         else:
             invertertype = 0
-            _LOGGER.error(f"unrecognized {hub.name} inverter type - serial number : {seriesnumber}")
+            _LOGGER.error("unrecognized %s inverter type - serial number : %s", hub.name, seriesnumber)
 
         if invertertype > 0:
             read_eps = configdict.get(CONF_READ_EPS, DEFAULT_READ_EPS)

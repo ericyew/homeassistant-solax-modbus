@@ -1,6 +1,21 @@
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def immediate_autorepeat_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the stop-on-invalid-input contract testable: the suite runs with the invalid-input grace window disabled.
+
+    test_autorepeat_input_grace.py restores the real window to cover the hold behavior.
+    """
+    monkeypatch.setattr("custom_components.solax_modbus.AUTOREPEAT_INVALID_INPUT_GRACE", 0.0)
+
+
+@pytest.fixture(params=[1000.0, 26.882, 604800.3])
+def clock_start(request: pytest.FixtureRequest) -> float:
+    """Cover an exact origin, a float binade crossing and a week of uptime."""
+    return float(request.param)
+
+
 class MockModbusResponse:
     def __init__(self, registers: list[int] | None = None, error: bool = False) -> None:
         self.registers = registers if registers else []
